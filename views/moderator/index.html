@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>贴吧吧务巡查</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="./style.css">
+</head>
+<body>
+<div id="app">
+  <header class="app-head">
+    <div class="brand">
+      <svg class="mark" viewBox="0 0 28 28" width="32" height="32" role="img" aria-label="贴吧吧务巡查标志">
+        <path d="M5 5.5h18a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2h-9l-5 4.5v-4.5H5a2 2 0 0 1-2-2v-11a2 2 0 0 1 2-2z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>
+        <path d="M9.5 13.2l3.2 3.2 6-6.2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      <div class="brand-text">
+        <h1>贴吧吧务巡查</h1>
+        <p id="finding" class="muted"></p>
+      </div>
+    </div>
+    <div id="head-actions" class="head-actions"></div>
+  </header>
+  <div id="status-slot"></div>
+  <div class="tabs"><div id="tablist" role="tablist" aria-label="功能分区"></div></div>
+  <main id="panels"></main>
+</div>
+<div id="toasts" class="toasts" role="status" aria-live="polite"></div>
+<script type="module" src="./app.js"></script>
+</body>
+</html>

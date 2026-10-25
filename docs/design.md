@@ -250,3 +250,16 @@ AstrBot ≥ 4.29 的插件视图：`views/<name>/index.html` 经 bridge 调用 `
 - 在插件目录跑测试时导入 astrbot 会生成 `data/`，已在 `.gitignore` 中忽略。
 - aiotieba 一律用假对象替身，不发真实网络请求。
 - 导入自检在 AstrBot 根目录执行：`__import__("data.plugins.astrbot_plugin_tieba_moderator.main")`。
+
+## 12. v0.2 按吧配置
+
+配置格式、容错、吧名匹配、吧规与推送路由，以及按吧权限的完整约定见 [按吧配置契约](forum-config.md)。本节补充实现接口：
+
+- `core/forums.py` 的纯函数 `parse_forum_config(config)` 返回冻结的 `ForumConfig` 和英文 warning；`profiles` 使用只读映射，字段不反向改写原配置。巡查列表是全局 `forums` 与有效覆盖条目的保序并集，键统一为 `strip().casefold()`。
+- `ForumProfile.rules_overridden` / `sessions_overridden` 是用于状态标注的布尔元数据：有效非空的本吧值即为显式覆盖，即使与全局值相同；空值回落不标注。非空吧规保留原文本，展示吧名保留大小写但去掉首尾空白。
+- 契约未指定的畸形外层 `forums` / `forum_overrides` 按空列表处理；非字符串吧名跳过并记录 warning；解析器中的畸形全局 `judge` / `notify` 按空配置处理。
+- `LlmJudge(..., forum_rules: Mapping[str, str] | None = None)` 接收按规范化吧名索引的已回落吧规，构造时预建系统提示。普通审查和空临时吧规试判都按实际 `item.fname` 选择；非空临时吧规只影响该次试判。
+- `/tb bind [吧名]` 保存后重新解析配置，推送路由立即生效。首次本吧绑定只写入当前会话，不把继承的全局会话复制成本吧覆盖；已有覆盖只更新第一个有效条目的 `sessions`，其余条目及未知字段原样保留。
+- `Store.query_cases(..., fnames: tuple[str, ...] = ())` 提供参数化多吧过滤，计数与分页共用条件；与原有精确 `fname` 和其他条件取交集。调用方传入规范化键；按契约使用 SQLite `lower()`，仅折叠 ASCII 大小写，不提供完整 Unicode casefold 匹配。
+- 权限判断按契约 §5 独立接入；此处解析器只保留全局操作员与本吧吧务字段，不提供授权判断函数。Web 状态沿用统一的 `PatrolSettings.forums`，无需重复解析。
+

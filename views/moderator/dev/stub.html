@@ -1,0 +1,26 @@
+<!doctype html>
+<!-- DEV-ONLY harness. AstrBot serves only views/<name>/index.html; this file is never loaded in production.
+     It defines a fake window.AstrBotPluginView (stub-bridge.js), then loads the real ../index.html markup
+     and ../app.js unchanged. Serve views/moderator over http (module scripts do not run from file://):
+       python -m http.server 8765 --directory views/moderator   ->   http://localhost:8765/dev/stub.html?theme=dark -->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>贴吧吧务巡查（stub）</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="../style.css">
+<script src="./stub-bridge.js"></script>
+</head>
+<body>
+<script type="module">
+  // Copy the real page's body markup (static, no data) and then start the real app.
+  const html = await (await fetch("../index.html")).text();
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  for (const node of [...doc.body.children]) {
+    if (node.tagName !== "SCRIPT") document.body.append(document.importNode(node, true));
+  }
+  await import("../app.js");
+</script>
+</body>
+</html>

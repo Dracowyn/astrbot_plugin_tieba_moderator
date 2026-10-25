@@ -3,6 +3,8 @@
 Marker expiry uses the last local write time, not Tieba's thread activity time
 or reply count. Purging never deletes cases. Each mutation commits before it
 returns so independent Store connections immediately observe completed writes.
+WebUI JSON filtering requires SQLite JSON1 (built in since SQLite 3.38).
+Reports are retained in save order; insertion and retention pruning are atomic.
 """
 
 from __future__ import annotations
@@ -14,7 +16,15 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
-from .models import Author, Case, CaseStatus, ContentItem, ItemKind, Verdict
+from .models import (
+    Author,
+    Case,
+    CaseStatus,
+    ContentItem,
+    ItemKind,
+    PatrolReport,
+    Verdict,
+)
 
 
 class Store:
@@ -65,6 +75,18 @@ class Store:
                 note TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS cases_status_id ON cases (status, id);
+            CREATE TABLE IF NOT EXISTS reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                started_at INTEGER NOT NULL,
+                finished_at INTEGER NOT NULL,
+                forums TEXT NOT NULL,
+                reviewed INTEGER NOT NULL,
+                reported INTEGER NOT NULL,
+                auto_deleted INTEGER NOT NULL,
+                skipped INTEGER NOT NULL,
+                deferred INTEGER NOT NULL,
+                errors TEXT NOT NULL
+            );
             """
         )
 
@@ -271,6 +293,165 @@ class Store:
             (status.value, limit),
         ).fetchall()
         return [_case_from_row(row) for row in rows]
+
+    def query_cases(
+        self,
+        *,
+        statuses: tuple[CaseStatus, ...] = (),
+        fname: str = "",
+        fnames: tuple[str, ...] = (),
+        category: str = "",
+        kind: ItemKind | None = None,
+        q: str = "",
+        offset: int = 0,
+        limit: int = 20,
+    ) -> tuple[int, list[Case]]:
+        """Query cases using SQLite JSON1 fields and literal substring matching.
+
+        Requires SQLite's json_extract function, supplied by JSON1 and built in
+        since SQLite 3.38. LIKE uses SQLite's default case-matching semantics;
+        percent signs, underscores and backslashes in q are literal characters.
+
+        Args:
+            statuses: Allowed statuses; empty means no status restriction.
+            fname: Exact forum name; empty disables this filter.
+            fnames: Allowed forum keys, already stripped and casefolded by the
+                caller; empty disables this filter. SQLite lower() folds ASCII
+                only. Combined with all other filters, including exact fname.
+            category: Exact verdict category; empty disables this filter.
+            kind: Exact content kind, or None for all kinds.
+            q: Substring of the title, body, author nickname or login name.
+            offset: Number of matching cases to skip, clamped to at least zero.
+            limit: Page size, clamped to the inclusive range 1 through 100.
+
+        Returns:
+            Total matching cases before pagination and the page in descending
+            case-ID order, restored as frozen nested models.
+        """
+        clauses: list[str] = []
+        parameters: list[str] = []
+        if statuses:
+            placeholders = ", ".join("?" for _ in statuses)
+            clauses.append(f"status IN ({placeholders})")
+            parameters.extend(status.value for status in statuses)
+        if fnames:
+            placeholders = ", ".join("?" for _ in fnames)
+            clauses.append(f"lower(json_extract(item, '$.fname')) IN ({placeholders})")
+            parameters.extend(fnames)
+        for expression, value in (
+            ("json_extract(item, '$.fname')", fname),
+            ("json_extract(verdict, '$.category')", category),
+            ("json_extract(item, '$.kind')", kind.value if kind is not None else None),
+        ):
+            if value:
+                clauses.append(f"{expression} = ?")
+                parameters.append(value)
+        if q:
+            escaped = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            paths = ("$.title", "$.text", "$.author.nick_name", "$.author.user_name")
+            clauses.append(
+                "("
+                + " OR ".join(
+                    f"json_extract(item, '{path}') LIKE ? ESCAPE '\\'" for path in paths
+                )
+                + ")"
+            )
+            parameters.extend([f"%{escaped}%"] * len(paths))
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        total = self._connection.execute(
+            "SELECT COUNT(*) FROM cases" + where, parameters
+        ).fetchone()[0]
+        rows = self._connection.execute(
+            "SELECT * FROM cases" + where + " ORDER BY id DESC LIMIT ? OFFSET ?",
+            (*parameters, max(1, min(100, limit)), max(0, offset)),
+        ).fetchall()
+        return total, [_case_from_row(row) for row in rows]
+
+    def case_stats(self, since: int) -> list[tuple[str, CaseStatus, float]]:
+        """Read raw statistics rows for the inclusive case creation-time window.
+
+        Requires SQLite JSON1's json_extract function. Aggregation, including
+        handling of review-failure categories, belongs to the WebUI API layer.
+
+        Args:
+            since: Inclusive Unix timestamp lower bound on created_at.
+
+        Returns:
+            Category, current status and confidence for each matching case.
+        """
+        rows = self._connection.execute(
+            """
+            SELECT json_extract(verdict, '$.category'), status,
+                   json_extract(verdict, '$.confidence')
+            FROM cases WHERE created_at >= ? ORDER BY id
+            """,
+            (since,),
+        ).fetchall()
+        return [(row[0], CaseStatus(row[1]), float(row[2])) for row in rows]
+
+    def save_report(self, report: PatrolReport) -> None:
+        """Persist a report and atomically retain the 500 most recently saved.
+
+        Args:
+            report: Immutable report; forum and error tuples are stored as JSON.
+        """
+        with self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO reports (
+                    started_at, finished_at, forums, reviewed, reported,
+                    auto_deleted, skipped, deferred, errors
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    report.started_at,
+                    report.finished_at,
+                    json.dumps(report.forums, ensure_ascii=False),
+                    report.reviewed,
+                    report.reported,
+                    report.auto_deleted,
+                    report.skipped,
+                    report.deferred,
+                    json.dumps(report.errors, ensure_ascii=False),
+                ),
+            )
+            self._connection.execute(
+                """
+                DELETE FROM reports WHERE id NOT IN (
+                    SELECT id FROM reports ORDER BY id DESC LIMIT ?
+                )
+                """,
+                (500,),
+            )
+
+    def list_reports(self, limit: int) -> list[PatrolReport]:
+        """Read saved reports, newest saves first, including timestamp ties.
+
+        Args:
+            limit: Maximum reports to return; nonpositive values return none.
+
+        Returns:
+            Frozen reports with forum and error tuples restored from JSON.
+        """
+        if limit <= 0:
+            return []
+        rows = self._connection.execute(
+            "SELECT * FROM reports ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [
+            PatrolReport(
+                started_at=row["started_at"],
+                finished_at=row["finished_at"],
+                forums=tuple(json.loads(row["forums"])),
+                reviewed=row["reviewed"],
+                reported=row["reported"],
+                auto_deleted=row["auto_deleted"],
+                skipped=row["skipped"],
+                deferred=row["deferred"],
+                errors=tuple(json.loads(row["errors"])),
+            )
+            for row in rows
+        ]
 
     def count_cases(self, status: CaseStatus) -> int:
         """Count cases currently in the specified status.

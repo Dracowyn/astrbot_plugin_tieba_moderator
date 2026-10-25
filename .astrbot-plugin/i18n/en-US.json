@@ -1,0 +1,8 @@
+{
+  "views": {
+    "moderator": {
+      "title": "Tieba Moderation",
+      "description": "Pending queue with images, case history, false-positive stats and trial reviews."
+    }
+  }
+}

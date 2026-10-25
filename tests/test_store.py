@@ -1,9 +1,10 @@
 """Persistence, expiry, and atomic-update tests for the SQLite store."""
 
+import json
 import sqlite3
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import FrozenInstanceError, replace
+from dataclasses import FrozenInstanceError, asdict, replace
 from itertools import count
 from pathlib import Path
 from threading import Barrier
@@ -15,6 +16,7 @@ from astrbot_plugin_tieba_moderator.core.models import (
     CaseStatus,
     ContentItem,
     ItemKind,
+    PatrolReport,
     Verdict,
 )
 from astrbot_plugin_tieba_moderator.core.store import Store
@@ -335,3 +337,405 @@ def test_two_connections_increment_failure_counter_without_lost_updates(
     with ThreadPoolExecutor(max_workers=2) as executor:
         results = list(executor.map(increment, range(2)))
     assert sorted(results[0] + results[1]) == list(range(1, 21))
+
+
+@pytest.fixture
+def query_cases_data(store, item):
+    rows = [
+        (
+            "龙",
+            ItemKind.THREAD,
+            CaseStatus.PENDING,
+            "广告",
+            "target title",
+            "quiet",
+            "alpha",
+            "one",
+        ),
+        (
+            "龙",
+            ItemKind.POST,
+            CaseStatus.DELETED,
+            "辱骂",
+            "beta",
+            "target body",
+            "beta",
+            "two",
+        ),
+        (
+            "猫",
+            ItemKind.COMMENT,
+            CaseStatus.PENDING,
+            "广告",
+            "gamma",
+            "quiet",
+            "target nick",
+            "three",
+        ),
+        (
+            "龙",
+            ItemKind.POST,
+            CaseStatus.AUTO_DELETED,
+            "广告",
+            "delta",
+            "quiet",
+            "delta",
+            "target login",
+        ),
+        (
+            "龙脉",
+            ItemKind.THREAD,
+            CaseStatus.IGNORED,
+            "广告引流",
+            "fifth",
+            "quiet",
+            "epsilon",
+            "five",
+        ),
+    ]
+    cases = []
+    for index, (fname, kind, status, category, title, text, nick, name) in enumerate(
+        rows
+    ):
+        content = replace(
+            item,
+            pid=100 + index,
+            fname=fname,
+            kind=kind,
+            title=title,
+            text=text,
+            author=replace(item.author, nick_name=nick, user_name=name),
+        )
+        cases.append(
+            store.create_case(
+                content,
+                Verdict(violation=True, category=category, confidence=0.9),
+                status,
+                100 + index,
+            )
+        )
+    return cases
+
+
+def test_query_cases_empty_database(store):
+    assert store.query_cases() == (0, [])
+
+
+@pytest.mark.parametrize(
+    "filters,indices",
+    [
+        ({}, [4, 3, 2, 1, 0]),
+        ({"statuses": ()}, [4, 3, 2, 1, 0]),
+        ({"fnames": ()}, [4, 3, 2, 1, 0]),
+        ({"fnames": ("龙", "猫")}, [3, 2, 1, 0]),
+        ({"fnames": ("missing",)}, []),
+        ({"fnames": ("龙", "猫"), "statuses": (CaseStatus.PENDING,)}, [2, 0]),
+        ({"fnames": ("龙", "猫"), "fname": "龙"}, [3, 1, 0]),
+        ({"fnames": ("猫",), "fname": "龙"}, []),
+        ({"statuses": (CaseStatus.PENDING,)}, [2, 0]),
+        ({"statuses": (CaseStatus.PENDING, CaseStatus.DELETED)}, [2, 1, 0]),
+        ({"fname": "龙"}, [3, 1, 0]),
+        ({"category": "广告"}, [3, 2, 0]),
+        ({"kind": ItemKind.POST}, [3, 1]),
+        ({"kind": ItemKind.COMMENT}, [2]),
+        ({"kind": ItemKind.THREAD}, [4, 0]),
+        ({"q": "target"}, [3, 2, 1, 0]),
+        ({"q": "title"}, [0]),
+        ({"q": "body"}, [1]),
+        ({"q": "nick"}, [2]),
+        ({"q": "login"}, [3]),
+        ({"q": "龙"}, []),
+        ({"q": "广告"}, []),
+        ({"fname": "missing"}, []),
+        ({"category": "missing"}, []),
+        ({"statuses": (CaseStatus.RESTORED,)}, []),
+        ({"fname": "龙", "q": "target"}, [3, 1, 0]),
+        (
+            {
+                "statuses": (CaseStatus.PENDING,),
+                "fname": "龙",
+                "fnames": ("龙", "猫"),
+                "category": "广告",
+                "kind": ItemKind.THREAD,
+                "q": "title",
+            },
+            [0],
+        ),
+        ({"fname": "龙", "kind": ItemKind.POST, "category": "广告", "q": "login"}, [3]),
+    ],
+)
+def test_query_cases_filters_and_combinations(
+    store, query_cases_data, filters, indices
+):
+    total, cases = store.query_cases(**filters)
+    assert total == len(indices)
+    assert cases == [query_cases_data[index] for index in indices]
+
+
+@pytest.mark.parametrize(
+    "keyword,match,near_match",
+    [
+        ("%", "50% sale", "50X sale"),
+        ("_", "a_b", "axb"),
+        ("\\", "a\\b", "ab"),
+        ("%_\\path", "%_\\path", "XXpath"),
+        ("O'Reilly", "O'Reilly", "Other"),
+        ("中文", "这里有中文", "这里没有"),
+    ],
+)
+@pytest.mark.parametrize("field", ["title", "text", "nick_name", "user_name"])
+def test_query_cases_treats_like_metacharacters_as_literal_substrings(
+    store, item, verdict, keyword, match, near_match, field
+):
+    plain = replace(
+        item,
+        title="plain",
+        text="plain",
+        author=replace(item.author, nick_name="plain", user_name="plain"),
+    )
+
+    def content(value):
+        value = f"before {value} after"
+        if field in ("nick_name", "user_name"):
+            return replace(plain, author=replace(plain.author, **{field: value}))
+        return replace(plain, **{field: value})
+
+    expected = store.create_case(content(match), verdict, CaseStatus.PENDING, 1)
+    store.create_case(content(near_match), verdict, CaseStatus.PENDING, 2)
+    assert store.query_cases(q=keyword) == (1, [expected])
+
+
+def test_query_cases_exact_filters_accept_literal_quotes(store, item, verdict):
+    case = store.create_case(
+        replace(item, fname="O'Reilly_%"),
+        replace(verdict, category="quoted_'%"),
+        CaseStatus.PENDING,
+        1,
+    )
+    store.create_case(item, verdict, CaseStatus.PENDING, 2)
+    assert store.query_cases(fname="O'Reilly_%", category="quoted_'%") == (1, [case])
+
+
+def test_query_cases_fnames_matches_ascii_and_chinese_without_changing_names(
+    store: Store, item: ContentItem, verdict: Verdict
+) -> None:
+    names = ("PyThOn", "python", "中文Python", "中文", "other")
+    cases = [
+        store.create_case(replace(item, fname=name), verdict, CaseStatus.PENDING, index)
+        for index, name in enumerate(names)
+    ]
+
+    assert store.query_cases(fnames=("python", "中文python", "中文")) == (
+        4,
+        list(reversed(cases[:4])),
+    )
+    assert store.query_cases(fnames=("python",), fname="PyThOn") == (1, [cases[0]])
+    assert store.query_cases(fnames=("python",), fname="PYTHON") == (0, [])
+
+
+@pytest.mark.parametrize("fname", ["O'Reilly_%", "x') OR 1=1 --"])
+def test_query_cases_fnames_treats_quoted_names_as_literals(
+    store: Store, item: ContentItem, verdict: Verdict, fname: str
+) -> None:
+    expected = store.create_case(
+        replace(item, fname=fname), verdict, CaseStatus.PENDING, 1
+    )
+    store.create_case(item, verdict, CaseStatus.PENDING, 2)
+
+    assert store.query_cases(fnames=(fname.casefold(),)) == (1, [expected])
+
+
+def test_query_cases_fnames_pagination_preserves_filtered_total(
+    store, query_cases_data
+):
+    filters = {"fnames": ("龙", "猫"), "statuses": (CaseStatus.PENDING,)}
+
+    assert store.query_cases(**filters, offset=0, limit=1) == (
+        2,
+        [query_cases_data[2]],
+    )
+    assert store.query_cases(**filters, offset=1, limit=1) == (
+        2,
+        [query_cases_data[0]],
+    )
+    assert store.query_cases(**filters, offset=2, limit=1) == (2, [])
+    assert store.query_cases(**filters, offset=999, limit=20) == (2, [])
+
+
+def test_query_cases_pagination_preserves_filtered_total(store, query_cases_data):
+    assert store.query_cases(fname="龙", offset=1, limit=1) == (
+        3,
+        [query_cases_data[1]],
+    )
+    assert store.query_cases(fname="龙", offset=3, limit=1) == (3, [])
+    assert store.query_cases(fname="龙", offset=999, limit=20) == (3, [])
+
+
+def test_query_cases_clamps_offset_and_limit(store, item, verdict):
+    cases = [
+        store.create_case(item, verdict, CaseStatus.PENDING, now) for now in range(105)
+    ]
+    assert store.query_cases(offset=-10, limit=1000) == (
+        105,
+        list(reversed(cases))[:100],
+    )
+    assert store.query_cases(limit=0) == (105, [cases[-1]])
+    assert store.query_cases(limit=-10) == (105, [cases[-1]])
+    assert store.query_cases(offset=100, limit=100) == (105, list(reversed(cases[:5])))
+
+
+def test_case_stats_creation_time_window_and_current_status(store, item, verdict):
+    assert store.case_stats(100) == []
+    before = store.create_case(item, verdict, CaseStatus.PENDING, 99)
+    edge = store.create_case(
+        item, replace(verdict, confidence=0), CaseStatus.PENDING, 100
+    )
+    store.create_case(item, replace(verdict, confidence=1.0), CaseStatus.BANNED, 101)
+    store.create_case(
+        item, Verdict(violation=False, category="审查失败"), CaseStatus.PENDING, 102
+    )
+    store.transition(
+        before.id,
+        from_=(CaseStatus.PENDING,),
+        to=CaseStatus.DELETED,
+        by="moderator",
+        now=200,
+    )
+    store.transition(
+        edge.id,
+        from_=(CaseStatus.PENDING,),
+        to=CaseStatus.IGNORED,
+        by="moderator",
+        now=201,
+    )
+    rows = store.case_stats(100)
+    assert sorted(rows) == sorted(
+        [
+            (verdict.category, CaseStatus.IGNORED, 0.0),
+            (verdict.category, CaseStatus.BANNED, 1.0),
+            ("审查失败", CaseStatus.PENDING, 0.0),
+        ]
+    )
+    assert all(
+        isinstance(status, CaseStatus) and isinstance(confidence, float)
+        for _, status, confidence in rows
+    )
+    assert store.case_stats(103) == []
+
+
+@pytest.fixture
+def report() -> PatrolReport:
+    return PatrolReport(
+        started_at=100,
+        finished_at=120,
+        forums=("龙", "测试吧"),
+        reviewed=12,
+        reported=3,
+        auto_deleted=2,
+        skipped=5,
+        deferred=7,
+        errors=("下载失败：离线", "quoted ' error\nsecond line"),
+    )
+
+
+def test_reports_roundtrip_reopen_and_descending_save_order(tmp_path, report):
+    path = tmp_path / "reports.db"
+    store = Store(path, clock=count(100).__next__)
+    newer = replace(report, started_at=130, finished_at=150, forums=(), errors=())
+    same_time = replace(newer, reviewed=99)
+    try:
+        assert store.list_reports(20) == []
+        store.save_report(report)
+        store.save_report(newer)
+        store.save_report(same_time)
+    finally:
+        store.close()
+    reopened = Store(path, clock=count(200).__next__)
+    try:
+        loaded = reopened.list_reports(20)
+        assert loaded == [same_time, newer, report]
+        assert all(isinstance(value, PatrolReport) for value in loaded)
+        assert isinstance(loaded[-1].forums, tuple)
+        assert isinstance(loaded[-1].errors, tuple)
+        with pytest.raises(FrozenInstanceError):
+            loaded[-1].reviewed = 0
+        assert reopened.list_reports(1) == [same_time]
+        assert reopened.list_reports(0) == []
+        assert reopened.list_reports(-1) == []
+    finally:
+        reopened.close()
+
+
+def test_save_report_retains_exactly_latest_500_without_touching_cases(
+    store, report, item, verdict
+):
+    case = store.create_case(item, verdict, CaseStatus.PENDING, 1)
+    store.mark_seen(item.key)
+    reports = [
+        replace(report, started_at=index, finished_at=index + 1) for index in range(505)
+    ]
+    for value in reports[:500]:
+        store.save_report(value)
+    assert store.list_reports(1000) == list(reversed(reports[:500]))
+    for value in reports[500:]:
+        store.save_report(value)
+    assert store.list_reports(1000) == list(reversed(reports[5:]))
+    assert store.get_case(case.id) == case
+    assert store.is_seen(item.key)
+
+
+def test_opening_legacy_database_adds_reports_and_preserves_existing_case(
+    tmp_path, item, verdict, report
+):
+    path = tmp_path / "legacy.db"
+    connection = sqlite3.connect(path)
+    try:
+        connection.executescript("""
+            CREATE TABLE cases (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                item TEXT NOT NULL, verdict TEXT NOT NULL, status TEXT NOT NULL,
+                created_at INTEGER NOT NULL, handled_by TEXT NOT NULL DEFAULT '',
+                handled_at INTEGER NOT NULL DEFAULT 0, note TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE seen (key TEXT PRIMARY KEY, updated_at INTEGER NOT NULL);
+        """)
+        with connection:
+            connection.execute(
+                "INSERT INTO cases (id, item, verdict, status, created_at) VALUES (?, ?, ?, ?, ?)",
+                (
+                    7,
+                    json.dumps(asdict(item)),
+                    json.dumps(asdict(verdict)),
+                    "pending",
+                    50,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO seen (key, updated_at) VALUES (?, ?)", (item.key, 60)
+            )
+        assert (
+            connection.execute(
+                "SELECT name FROM sqlite_master WHERE name = 'reports'"
+            ).fetchone()
+            is None
+        )
+    finally:
+        connection.close()
+    database = Store(path, clock=count(100).__next__)
+    try:
+        assert database.get_case(7) == Case(
+            id=7, item=item, verdict=verdict, status=CaseStatus.PENDING, created_at=50
+        )
+        assert database.is_seen(item.key)
+        assert database.list_reports(20) == []
+        database.save_report(report)
+        assert database.list_reports(20) == [report]
+        assert database.query_cases() == (1, [database.get_case(7)])
+        assert database.create_case(item, verdict, CaseStatus.PENDING, 70).id == 8
+    finally:
+        database.close()
+    reopened = Store(path, clock=count(200).__next__)
+    try:
+        assert reopened.list_reports(20) == [report]
+    finally:
+        reopened.close()

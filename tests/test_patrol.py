@@ -947,6 +947,7 @@ async def test_notification_attempts_all_sessions_and_reports_partial_failure(
 ):
     plugin, _ = command_env
     plugin.config["notify"] = {"sessions": ["first", "second", "third"]}
+    plugin._forum_config, _ = entry.parse_forum_config(plugin.config)
     plugin.context.send_message.side_effect = [
         RuntimeError("platform offline"),
         False,
@@ -964,6 +965,7 @@ async def test_notification_attempts_all_sessions_and_reports_partial_failure(
     ]
     assert plugin._store.get_case(case.id) == case
     plugin.config["notify"] = {"sessions": []}
+    plugin._forum_config, _ = entry.parse_forum_config(plugin.config)
     with pytest.raises(RuntimeError):
         await plugin._notify(case)
     assert plugin.context.send_message.await_count == 3

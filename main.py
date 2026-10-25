@@ -3,21 +3,26 @@
 from __future__ import annotations
 
 import asyncio
-import re
-import time
 import traceback
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, StarTools
 
+from .core.forums import (
+    OperatorScope,
+    bind_session,
+    missing_case_reply,
+    parse_forum_config,
+    pending_count,
+    scope_forum_keys,
+)
 from .core.judge import FAILED_CATEGORY
 from .core.models import (
     ALLOWED_BAN_DAYS,
     Case,
     CaseStatus,
     ImageFetchError,
-    ItemKind,
     JudgeError,
     PatrolReport,
     TiebaActionError,
@@ -27,41 +32,27 @@ from .core.store import Store
 from .services.case_service import CaseError, CaseService
 from .services.llm_judge import LlmJudge
 from .services.patrol import Patrol, PatrolSettings
+from .services.render import (
+    FORUM_CHARS,
+    TITLE_CHARS,
+    case_list_line,
+    format_case,
+    format_report,
+    one_line,
+)
 from .services.tieba_gateway import TiebaGateway
+from .web.routes import WebRoutes, WebServices
 
 PLUGIN_NAME = "astrbot_plugin_tieba_moderator"
 DB_FILE = "moderator.db"
 MIN_INTERVAL_SECONDS = 60
 STARTUP_DELAY_SECONDS = 30
 """Give the messaging platforms time to connect before the first push."""
-EXCERPT_CHARS = 120
-TITLE_CHARS = 40
-NAME_CHARS = 40
-CATEGORY_CHARS = 20
-REASON_CHARS = 200
-NOTE_CHARS = 300
-FORUM_CHARS = 40
-ERROR_CHARS = 200
 LIST_LIMIT = 20
-REPORT_ERROR_LINES = 3
-
-KIND_NAMES = {
-    ItemKind.THREAD: "主题帖",
-    ItemKind.POST: "楼层",
-    ItemKind.COMMENT: "楼中楼",
-}
-STATUS_NAMES = {
-    CaseStatus.PENDING: "待处理",
-    CaseStatus.AUTO_DELETED: "已自动删除",
-    CaseStatus.DELETED: "已删除",
-    CaseStatus.BANNED: "已删除并封禁",
-    CaseStatus.IGNORED: "已忽略",
-    CaseStatus.RESTORED: "已恢复",
-}
 DAYS_TEXT = "|".join(str(d) for d in ALLOWED_BAN_DAYS)
 NO_ACCOUNT_REPLY = "未配置吧务账号的 BDUSS / STOKEN，巡查和贴吧操作不可用。"
 NO_PERMISSION_REPLY = (
-    "你没有处理案件的权限（需要 AstrBot 管理员或在 notify.operators 中）。"
+    "你没有处理案件的权限（需要 AstrBot 管理员、全局操作员，或该吧的吧务）。"
 )
 ADMIN_ONLY_REPLY = "该指令只有 AstrBot 管理员可以使用。"
 
@@ -102,144 +93,6 @@ def _parse_id(raw: str) -> int | None:
     return int(raw)
 
 
-_CONTROL_CHARS = re.compile(
-    "[\x00-\x08\x0b-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2066-\u2069]"
-)
-"""Control and bidirectional-override characters that must not reach a push."""
-
-
-def _one_line(value: object, limit: int) -> str:
-    """Render an untrusted field as one safe line of plain text.
-
-    Titles, nicknames, verdict text and moderator notes are attacker-influenced.
-    A newline in any of them would let the author forge an extra line in the
-    push card, including a fake ``处理：/tb ban ...`` hint, so every field that
-    reaches a message goes through here.
-
-    Args:
-        value: The raw field; converted with ``str``.
-        limit: Maximum characters kept.
-
-    Returns:
-        Text with control and bidi characters dropped, whitespace collapsed and
-        the length capped.
-    """
-    text = _CONTROL_CHARS.sub("", str(value))
-    text = re.sub(r"\s+", " ", text).strip()
-    return text[:limit]
-
-
-def format_case(case: Case, *, detail: bool = False) -> str:
-    """Render a case as plain text for moderators.
-
-    No images are attached on purpose: the content may be pornographic and
-    pushing it could get the group or the bot flagged.
-
-    Args:
-        case: The case to render.
-        detail: Also show handler and note (for ``/tb show``).
-
-    Returns:
-        Plain text.
-    """
-    item, verdict = case.item, case.verdict
-    author = item.author
-    who = _one_line(author.nick_name, NAME_CHARS) or _one_line(
-        author.user_name, NAME_CHARS
-    )
-    if not who:
-        who = str(author.user_id)
-    elif author.user_name and author.user_name != who:
-        who = f"{who}（{_one_line(author.user_name, NAME_CHARS)}）"
-    kind = KIND_NAMES[item.kind]
-    if item.kind is ItemKind.POST:
-        kind += f"（{item.floor} 楼）"
-    elif item.kind is ItemKind.COMMENT:
-        kind += f"（{item.floor} 楼的楼中楼）"
-    excerpt = _one_line(item.text, EXCERPT_CHARS)
-    if item.kind is ItemKind.THREAD and item.title:
-        excerpt = f"【{_one_line(item.title, TITLE_CHARS)}】{excerpt}"
-    category = _one_line(verdict.category, CATEGORY_CHARS) or "未分类"
-    failed = verdict.category == FAILED_CATEGORY
-
-    lines = [
-        f"【贴吧巡查】案件 #{case.id} {STATUS_NAMES[case.status]}",
-        f"吧：{_one_line(item.fname, FORUM_CHARS)}吧 | 类型：{kind}",
-        f"作者：{who}",
-        f"链接：{_one_line(item.link, 120)}",
-    ]
-    if failed:
-        # A failed review has no usable confidence or ban suggestion.
-        lines.append("判定：审查失败（未能自动判定）")
-    else:
-        lines.append(f"判定：{category} | 置信度 {verdict.confidence:.2f}")
-        ban = f"{verdict.ban_days} 天（需吧务确认）" if verdict.ban_days else "不封禁"
-        lines.append(f"建议封禁：{ban}")
-    lines += [
-        f"理由：{_one_line(verdict.reason, REASON_CHARS) or '无'}",
-        f"摘录：{excerpt or '（无文字）'}",
-    ]
-    if item.image_urls:
-        media = "视频（封面）" if item.has_video else f"{len(item.image_urls)} 张图片"
-        lines.append(f"含{media}，消息不附图，请点链接查看。")
-    if failed:
-        lines.append("注意：这条内容没能自动审查，请点链接人工判断后再决定是否处理。")
-    if detail and case.handled_by:
-        handled_at = time.strftime("%Y-%m-%d %H:%M", time.localtime(case.handled_at))
-        lines.append(
-            f"处理人：{_one_line(case.handled_by, NAME_CHARS)}（{handled_at}）"
-        )
-    if detail and case.note:
-        lines.append(f"备注：{_one_line(case.note, NOTE_CHARS)}")
-    if case.status is CaseStatus.PENDING:
-        lines.append(
-            f"处理：/tb del {case.id} | /tb ban {case.id} <{DAYS_TEXT}> | "
-            f"/tb ignore {case.id}"
-        )
-    elif case.status is CaseStatus.AUTO_DELETED:
-        lines.append(
-            f"巡查已自动删除该内容。误删请恢复：/tb restore {case.id}；"
-            f"需要封禁：/tb ban {case.id} <{DAYS_TEXT}>"
-        )
-    elif case.status is CaseStatus.DELETED:
-        lines.append(
-            f"恢复：/tb restore {case.id} | 封禁：/tb ban {case.id} <{DAYS_TEXT}>"
-        )
-    elif case.status is CaseStatus.BANNED:
-        lines.append(f"恢复内容（不解封）：/tb restore {case.id}")
-    return "\n".join(lines)
-
-
-def format_report(report: PatrolReport, *, errors: bool = True) -> str:
-    """Summarize a patrol report in a few lines.
-
-    Args:
-        report: The report.
-        errors: Include the error lines. Turned off for viewers who may not
-            handle cases, because the lines quote exception text.
-
-    Returns:
-        Plain text.
-    """
-    finished = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(report.finished_at))
-    lines = [
-        f"{finished}，用时 {max(0, report.finished_at - report.started_at)} 秒，"
-        f"巡查 {len(report.forums)} 个吧",
-        f"审查 {report.reviewed} | 上报 {report.reported} | "
-        f"自动删除 {report.auto_deleted} | 跳过 {report.skipped} | "
-        f"顺延 {report.deferred} | 错误 {len(report.errors)}",
-    ]
-    if errors:
-        lines += [
-            f"- {_one_line(e, ERROR_CHARS)}" for e in report.errors[:REPORT_ERROR_LINES]
-        ]
-        if len(report.errors) > REPORT_ERROR_LINES:
-            lines.append(
-                f"- ……另有 {len(report.errors) - REPORT_ERROR_LINES} 条，见日志"
-            )
-    return "\n".join(lines)
-
-
 class TiebaModeratorPlugin(Star):
     """Patrol Tieba forums and let an LLM flag rule-breaking content."""
 
@@ -275,12 +128,14 @@ class TiebaModeratorPlugin(Star):
             )
             report_threshold = auto_threshold
 
-        forums = [str(f).strip() for f in config.get("forums") or []]
+        self._forum_config, warnings = parse_forum_config(config)
+        for warning in warnings:
+            logger.warning(warning)
         whitelist = [str(w).strip() for w in patrol.get("whitelist") or []]
         review_images = bool(judge.get("review_images", True))
         max_images = int(_clamp_number(judge.get("max_images"), 4, 0, 9))
         self._settings = PatrolSettings(
-            forums=tuple(dict.fromkeys(f for f in forums if f)),
+            forums=self._forum_config.forums,
             thread_pages=int(_clamp_number(patrol.get("thread_pages"), 1, 1, 5)),
             lookback_hours=int(_clamp_number(patrol.get("lookback_hours"), 6, 1, 168)),
             review_posts=bool(patrol.get("review_posts", True)),
@@ -301,7 +156,11 @@ class TiebaModeratorPlugin(Star):
         self._judge = LlmJudge(
             context,
             provider_id=str(judge.get("provider_id") or ""),
-            rules=str(judge.get("rules") or ""),
+            rules=self._forum_config.default_rules,
+            forum_rules={
+                key: profile.rules
+                for key, profile in self._forum_config.profiles.items()
+            },
             timeout_seconds=_clamp_number(judge.get("timeout_seconds"), 60, 10, 600),
             review_images=review_images,
             max_images=max_images,
@@ -312,9 +171,96 @@ class TiebaModeratorPlugin(Star):
         self._patrol: Patrol | None = None
         self._cases: CaseService | None = None
         self._task: asyncio.Task | None = None
+        self._manual_task: asyncio.Task | None = None
+        """Background manual round, shared by ``/tb run`` and ``POST patrol/run``."""
         self._last_report: PatrolReport | None = None
-        self._manual_running = False
-        """True while a ``/tb run`` round is in flight, so repeats are refused."""
+        self._web = WebRoutes(self._web_services)
+        self._register_web_apis()
+
+    # ------------------------------------------------------------------
+    # Dashboard plugin view
+    # ------------------------------------------------------------------
+
+    def _register_web_apis(self) -> None:
+        """Register every plugin-view route under the plugin-name prefix.
+
+        Routes are matched by ``astrbot/dashboard/api/plugins.py:196-222``, which
+        passes each ``<name>`` segment as a keyword argument to the handler and
+        requires the dashboard JWT or a plugin-scoped API key
+        (``:398-438`` and ``astrbot/dashboard/api/auth.py:167-195``).
+        """
+        register = getattr(self.context, "register_web_api", None)
+        if register is None:
+            # Star contexts always expose register_web_api
+            # (astrbot/core/star/context.py:736); only a test double lacks it.
+            logger.warning(
+                "The star context has no register_web_api; the WebUI plugin view "
+                "routes are not registered."
+            )
+            return
+        web = self._web
+        routes: tuple[tuple[str, object, list[str], str], ...] = (
+            ("status", web.get_status, ["GET"], "Patrol status"),
+            ("cases", web.get_cases, ["GET"], "List cases"),
+            ("cases/<case_id>", web.get_case, ["GET"], "Get one case"),
+            (
+                "cases/<case_id>/images/<index>",
+                web.get_case_image,
+                ["GET"],
+                "Get one case image",
+            ),
+            (
+                "cases/<case_id>/delete",
+                web.post_delete,
+                ["POST"],
+                "Delete case content",
+            ),
+            ("cases/<case_id>/ban", web.post_ban, ["POST"], "Delete and ban"),
+            ("cases/<case_id>/ignore", web.post_ignore, ["POST"], "Ignore case"),
+            (
+                "cases/<case_id>/restore",
+                web.post_restore,
+                ["POST"],
+                "Restore case content",
+            ),
+            ("stats", web.get_stats, ["GET"], "Case statistics"),
+            ("reports", web.get_reports, ["GET"], "Patrol reports"),
+            ("patrol/run", web.post_patrol_run, ["POST"], "Start a patrol round"),
+            ("check", web.post_check, ["POST"], "Trial review of a thread"),
+        )
+        for path, handler, methods, desc in routes:
+            register(f"/{PLUGIN_NAME}/{path}", handler, methods, desc)
+
+    @property
+    def _manual_running(self) -> bool:
+        """Whether a manual patrol round is in flight.
+
+        Derived from the task so there is a single source of truth.
+        """
+        return self._manual_task is not None and not self._manual_task.done()
+
+    def _web_services(self) -> WebServices:
+        """Read the current dependencies for a Web API call.
+
+        Returns:
+            A snapshot of the live services. Handlers call this per request, so
+            a reload that replaces the store or the gateway is observed.
+        """
+        return WebServices(
+            store=self._store,
+            patrol=self._patrol,
+            gateway=self._gateway,
+            cases=self._cases,
+            judge=self._judge,
+            settings=self._settings,
+            interval_seconds=self._interval,
+            patrol_enabled=self._enabled,
+            loop_running=self._task is not None and not self._task.done(),
+            manual_running=self._manual_running,
+            start_patrol=self._start_manual_patrol,
+            redact=lambda exc: self._redact(exc, brief=True),
+            redact_trace=self._redact,
+        )
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -362,16 +308,23 @@ class TiebaModeratorPlugin(Star):
         )
 
     async def terminate(self) -> None:
-        """Stop the loop and release the gateway and the store."""
-        if self._task is not None:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
-            except Exception as exc:
-                logger.warning(f"Patrol loop ended with an error:\n{self._redact(exc)}")
-            self._task = None
+        """Stop the loops and release the gateway and the store."""
+        for name, task in (
+            ("manual patrol", self._manual_task),
+            ("patrol", self._task),
+        ):
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                except Exception as exc:
+                    logger.warning(
+                        f"The {name} task ended with an error:\n{self._redact(exc)}"
+                    )
+        self._task = None
+        self._manual_task = None
         if self._gateway is not None:
             try:
                 await self._gateway.close()
@@ -388,12 +341,58 @@ class TiebaModeratorPlugin(Star):
         while True:
             try:
                 report = await self._patrol.run_once()
-                self._last_report = report
-                if report.errors:
-                    logger.warning(f"Patrol round finished:\n{format_report(report)}")
+                self._finish_round(report)
             except Exception as exc:
                 logger.error(f"Patrol round failed:\n{self._redact(exc)}")
             await asyncio.sleep(self._interval)
+
+    def _finish_round(self, report: PatrolReport) -> None:
+        """Remember a finished round and persist its summary.
+
+        Args:
+            report: The report of the round that just finished.
+        """
+        self._last_report = report
+        if report.errors:
+            logger.warning(f"Patrol round finished:\n{format_report(report)}")
+        if self._store is not None:
+            try:
+                self._store.save_report(report)
+            except Exception as exc:
+                # A report is a convenience; losing one must not stop the loop.
+                logger.warning(f"Saving the patrol report failed:\n{self._redact(exc)}")
+
+    def _start_manual_patrol(self) -> bool:
+        """Start a manual round in the background.
+
+        Serves both ``/tb run`` and ``POST patrol/run`` so the two cannot run at
+        the same time.
+
+        Returns:
+            True when a round was started, False when one is already running.
+        """
+        if self._patrol is None:
+            return False
+        if self._manual_task is not None and not self._manual_task.done():
+            return False
+        self._manual_task = asyncio.create_task(self._run_manual_patrol())
+        return True
+
+    async def _run_manual_patrol(self) -> PatrolReport | None:
+        """Run one manual round, recording its report.
+
+        Returns:
+            The report, or None when the round failed.
+        """
+        try:
+            report = await self._patrol.run_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error(f"Manual patrol round failed:\n{self._redact(exc)}")
+            return None
+        self._finish_round(report)
+        return report
 
     def _redact(self, exc: BaseException, *, brief: bool = False) -> str:
         """Format an exception with credentials removed.
@@ -421,11 +420,12 @@ class TiebaModeratorPlugin(Star):
         Raises:
             RuntimeError: No session is bound, or at least one push failed.
         """
-        notify = self.config.get("notify") or {}
-        sessions = [str(s) for s in notify.get("sessions") or []]
+        sessions = self._forum_config.profile(case.item.fname).sessions
         if not sessions:
-            raise RuntimeError(f"案件 #{case.id} 未推送：没有绑定推送会话（/tb bind）")
-        text = format_case(case)
+            raise RuntimeError(
+                f"案件 #{case.id}（{case.item.fname} 吧）未推送：没有绑定推送会话"
+            )
+        text = format_case(case, days_text=DAYS_TEXT, failed_category=FAILED_CATEGORY)
         failed = []
         for umo in sessions:
             try:
@@ -450,19 +450,42 @@ class TiebaModeratorPlugin(Star):
     # Commands
     # ------------------------------------------------------------------
 
-    def _can_operate(self, event: AstrMessageEvent) -> bool:
-        """Whether the sender may handle cases.
+    def _scope(self, event: AstrMessageEvent) -> OperatorScope:
+        """Resolve what the command sender may moderate.
 
         Args:
             event: The command event.
 
         Returns:
-            True for AstrBot admins and senders listed in ``notify.operators``.
+            A global scope for AstrBot administrators and global operators,
+            the locally moderated forums for a forum moderator, otherwise an
+            empty scope.
         """
-        if event.is_admin():
-            return True
-        operators = (self.config.get("notify") or {}).get("operators") or []
-        return str(event.get_sender_id()) in {str(o).strip() for o in operators}
+        return self._forum_config.scope_for(
+            str(event.get_sender_id()), is_admin=event.is_admin()
+        )
+
+    def _case_for(self, event: AstrMessageEvent, case_id: int) -> Case | None:
+        """Load a case the sender is allowed to see.
+
+        A forum moderator gets None for a case in another forum, exactly as for
+        a missing case, so the reply cannot be used to probe case ids.
+
+        Args:
+            event: The command event.
+            case_id: Case identifier.
+
+        Returns:
+            The case, or None when it does not exist or is out of scope.
+        """
+        if self._store is None:
+            return None
+        case = self._store.get_case(case_id)
+        if case is None:
+            return None
+        if not self._forum_config.may_moderate(self._scope(event), case.item.fname):
+            return None
+        return case
 
     @filter.command_group("tb")
     def tb(self):
@@ -485,17 +508,29 @@ class TiebaModeratorPlugin(Star):
             if s.auto_delete_enabled
             else "关闭"
         )
+        forums = []
+        for fname in self._forum_config.forums:
+            profile = self._forum_config.profile(fname)
+            labels = []
+            if profile.rules_overridden:
+                labels.append("独立吧规")
+            if profile.sessions_overridden:
+                labels.append("独立推送")
+            forums.append(fname + (f"（{'、'.join(labels)}）" if labels else ""))
         lines = [
             f"巡查：{state}",
-            f"吧：{'、'.join(s.forums) or '未配置'}",
+            f"吧：{'、'.join(forums) or '未配置'}",
             f"自动删除：{auto} | 上报阈值 {s.report_threshold:.2f}",
         ]
+        scope = self._scope(event)
         if self._store is not None:
-            lines.append(f"待处理案件：{self._store.count_cases(CaseStatus.PENDING)}")
+            lines.append(f"待处理案件：{pending_count(self._store, scope)}")
         if self._last_report is not None:
+            # Error lines quote exception text from any forum, so they are for
+            # global operators only (forum-config contract §5).
             lines.append(
                 "上一轮："
-                + format_report(self._last_report, errors=self._can_operate(event))
+                + format_report(self._last_report, errors=scope.global_operator)
             )
         else:
             lines.append("上一轮：本次启动后还没有巡查过")
@@ -504,7 +539,8 @@ class TiebaModeratorPlugin(Star):
     @tb.command("run")
     async def tb_run(self, event: AstrMessageEvent):
         """立即巡查一轮"""
-        if not self._can_operate(event):
+        if not self._scope(event).global_operator:
+            # One round covers every forum, so local moderators may not start it.
             yield event.plain_result(NO_PERMISSION_REPLY)
             return
         if self._patrol is None:
@@ -513,69 +549,71 @@ class TiebaModeratorPlugin(Star):
         if not self._settings.forums:
             yield event.plain_result("没有配置要巡查的吧。")
             return
-        if self._manual_running:
+        if not self._start_manual_patrol():
             yield event.plain_result("已有一轮手动巡查在进行，请稍后。")
             return
-        self._manual_running = True
+        yield event.plain_result("开始巡查，完成后回复结果……")
+        task = self._manual_task
         try:
-            yield event.plain_result("开始巡查，完成后回复结果……")
-            try:
-                report = await self._patrol.run_once()
-            except Exception as exc:
-                logger.error(f"Manual patrol round failed:\n{self._redact(exc)}")
-                yield event.plain_result("巡查失败，详见 AstrBot 日志。")
+            report = await task
+        except asyncio.CancelledError:
+            if task.cancelled():
+                # terminate() cancelled the round; there is nobody to reply to.
                 return
-            self._last_report = report
-            yield event.plain_result("巡查完成：" + format_report(report, errors=True))
-        finally:
-            self._manual_running = False
+            raise
+        if report is None:
+            yield event.plain_result("巡查失败，详见 AstrBot 日志。")
+            return
+        yield event.plain_result("巡查完成：" + format_report(report, errors=True))
 
     @tb.command("list")
     async def tb_list(self, event: AstrMessageEvent):
         """列出待处理案件"""
-        if not self._can_operate(event):
+        scope = self._scope(event)
+        if not scope.any:
             yield event.plain_result(NO_PERMISSION_REPLY)
             return
-        total = self._store.count_cases(CaseStatus.PENDING)
+        if self._store is None:
+            yield event.plain_result("插件存储尚未就绪，请稍后重试。")
+            return
+        total, cases = self._store.query_cases(
+            statuses=(CaseStatus.PENDING,),
+            fnames=scope_forum_keys(scope),
+            limit=LIST_LIMIT,
+        )
         if not total:
             yield event.plain_result("没有待处理的案件。")
             return
         lines = [f"待处理案件 {total} 个（最多显示 {LIST_LIMIT} 个）："]
-        for case in self._store.list_cases(CaseStatus.PENDING, LIST_LIMIT):
-            item, verdict = case.item, case.verdict
-            source = item.title if item.kind is ItemKind.THREAD else item.text
-            excerpt = _one_line(source, 30)
-            who = _one_line(
-                item.author.nick_name or item.author.user_name, NAME_CHARS
-            ) or (str(item.author.user_id))
-            category = _one_line(verdict.category, CATEGORY_CHARS) or "未分类"
-            confidence = (
-                "审查失败"
-                if verdict.category == FAILED_CATEGORY
-                else f"{verdict.confidence:.2f}"
-            )
-            lines.append(
-                f"#{case.id} [{_one_line(item.fname, FORUM_CHARS)}] "
-                f"{KIND_NAMES[item.kind]} {category} {confidence} {who}：{excerpt}"
-            )
+        lines += [
+            case_list_line(case, failed_category=FAILED_CATEGORY) for case in cases
+        ]
         lines.append("详情：/tb show <编号>")
         yield event.plain_result("\n".join(lines))
 
     @tb.command("show")
     async def tb_show(self, event: AstrMessageEvent, case_id: str = ""):
         """查看案件详情"""
-        if not self._can_operate(event):
+        scope = self._scope(event)
+        if not scope.any:
             yield event.plain_result(NO_PERMISSION_REPLY)
             return
         cid = _parse_id(case_id)
         if cid is None:
             yield event.plain_result("用法：/tb show <案件编号>，编号是正整数。")
             return
-        case = self._store.get_case(cid)
+        case = self._case_for(event, cid)
         if case is None:
-            yield event.plain_result(f"案件 #{cid} 不存在。")
+            yield event.plain_result(missing_case_reply(cid, scope))
             return
-        yield event.plain_result(format_case(case, detail=True))
+        yield event.plain_result(
+            format_case(
+                case,
+                days_text=DAYS_TEXT,
+                failed_category=FAILED_CATEGORY,
+                detail=True,
+            )
+        )
 
     @tb.command("del")
     async def tb_del(self, event: AstrMessageEvent, case_id: str = ""):
@@ -615,7 +653,8 @@ class TiebaModeratorPlugin(Star):
         Yields:
             Reply results.
         """
-        if not self._can_operate(event):
+        scope = self._scope(event)
+        if not scope.any:
             yield event.plain_result(NO_PERMISSION_REPLY)
             return
         usage = (
@@ -634,6 +673,11 @@ class TiebaModeratorPlugin(Star):
             # The length check runs first: int() on a megabyte of digits is a
             # needlessly expensive parse triggered from chat.
             yield event.plain_result(f"用法：{usage}，封禁天数只能是 {DAYS_TEXT}。")
+            return
+        # Scope is checked before CaseService: an out-of-scope id must not reach
+        # the case service, which would otherwise act on another forum.
+        if self._case_for(event, cid) is None:
+            yield event.plain_result(missing_case_reply(cid, scope))
             return
         if self._cases is None:
             yield event.plain_result(NO_ACCOUNT_REPLY)
@@ -713,7 +757,8 @@ class TiebaModeratorPlugin(Star):
         ban = f"{verdict.ban_days} 天" if verdict.ban_days else "不封禁"
         lines = [
             f"审查结果（未做任何处置）：帖子 {thread_id}",
-            f"标题：{item.title} | 吧名：{item.fname}",
+            f"标题：{one_line(item.title, TITLE_CHARS)} | "
+            f"吧名：{one_line(item.fname, FORUM_CHARS)}",
             f"违规：{'是' if verdict.violation else '否'} | "
             f"类别：{verdict.category or '无'} | 置信度 {verdict.confidence:.2f}",
             f"理由：{verdict.reason or '无'}",
@@ -724,19 +769,21 @@ class TiebaModeratorPlugin(Star):
         yield event.plain_result("\n".join(lines))
 
     @tb.command("bind")
-    async def tb_bind(self, event: AstrMessageEvent):
-        """把当前会话加入推送列表"""
+    async def tb_bind(self, event: AstrMessageEvent, fname: str = ""):
+        """把当前会话加入全局或指定吧的推送列表"""
         if not event.is_admin():
             yield event.plain_result(ADMIN_ONLY_REPLY)
             return
-        umo = event.unified_msg_origin
-        notify = self.config.get("notify") or {}
-        sessions = [str(s) for s in notify.get("sessions") or []]
-        if umo in sessions:
-            yield event.plain_result("当前会话已经在推送列表里。")
+        result = bind_session(
+            self.config, self._forum_config, fname.strip(), event.unified_msg_origin
+        )
+        if isinstance(result, str):
+            yield event.plain_result(result)
             return
-        self.config["notify"] = {**notify, "sessions": [*sessions, umo]}
         self.config.save_config()
+        self._forum_config, warnings = parse_forum_config(self.config)
+        for warning in warnings:
+            logger.warning(warning)
         yield event.plain_result(
-            f"已把当前会话加入推送列表，共 {len(sessions) + 1} 个。"
+            f"已把当前会话加入{result.label}推送列表，共 {result.total} 个。"
         )
