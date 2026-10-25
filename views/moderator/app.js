@@ -1,11 +1,12 @@
 // Entry point: bridge handshake, theme, status bar and tab switching.
 
 import { errorText, getContext, initBridge, onContext } from "./api.js";
-import { el } from "./dom.js";
+import { confirmDialog, el } from "./dom.js";
 import { createStatusBar } from "./status.js";
 import { createCheckTab } from "./tab_check.js";
 import { createHistoryTab } from "./tab_history.js";
 import { createPendingTab } from "./tab_pending.js";
+import { createSettingsTab } from "./tab_settings.js";
 import { createStatsTab } from "./tab_stats.js";
 
 function applyTheme(context) {
@@ -21,12 +22,14 @@ function mountTabs(statusBar) {
     getStatus: statusBar.get,
     refreshStatus: statusBar.refresh,
     dataVersion: statusBar.dataVersion,
+    openTab: (id) => select(defs.find((d) => d.id === id), true),
   };
   const defs = [
     { id: "pending", label: "待处理", tab: createPendingTab(ctx) },
     { id: "history", label: "历史", tab: createHistoryTab(ctx) },
     { id: "stats", label: "统计", tab: createStatsTab(ctx) },
     { id: "check", label: "试判", tab: createCheckTab(ctx) },
+    { id: "settings", label: "设置", tab: createSettingsTab(ctx) },
   ];
   let active = defs[0];
 
@@ -49,7 +52,12 @@ function mountTabs(statusBar) {
     return panel;
   });
 
-  function select(def, focus) {
+  async function select(def, focus) {
+    // Leaving a tab with an unsaved form asks first.
+    if (def !== active && active.tab.isDirty?.()) {
+      const leave = await confirmDialog("当前表单有未保存的修改，离开后这些修改会丢失。", { title: "放弃未保存的修改？", okText: "放弃修改", danger: true });
+      if (!leave) return;
+    }
     active = def;
     defs.forEach((d, i) => {
       const on = d === def;
@@ -64,6 +72,7 @@ function mountTabs(statusBar) {
   select(defs[0], false);
   return {
     openPending: () => select(defs[0], true),
+    openTab: ctx.openTab,
     refreshActive: () => active.tab.refresh(),
   };
 }
@@ -84,6 +93,7 @@ async function main() {
   let tabs = null;
   const statusBar = createStatusBar({
     onOpenPending: () => tabs?.openPending(),
+    onOpenSettings: () => tabs?.openTab("settings"),
     onPatrolFinished: () => tabs?.refreshActive(),
   });
   document.getElementById("status-slot").replaceWith(statusBar.el);

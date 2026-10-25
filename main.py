@@ -1,19 +1,20 @@
-"""AstrBot plugin entry: config, background patrol, push messages and ``/tb``."""
+"""AstrBot plugin entry: persisted settings, patrol lifecycle and ``/tb``."""
 
 from __future__ import annotations
 
 import asyncio
+import dataclasses as dcs
 import traceback
 
-from astrbot.api import AstrBotConfig, logger
+from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, StarTools
 
 from .core.forums import (
+    ForumConfig,
     OperatorScope,
-    bind_session,
     missing_case_reply,
-    parse_forum_config,
+    parse_case_id,
     pending_count,
     scope_forum_keys,
 )
@@ -28,10 +29,12 @@ from .core.models import (
     TiebaActionError,
     decide_action,
 )
+from .core.settings import SettingsSnapshot, default_global_settings, resolve
 from .core.store import Store
 from .services.case_service import CaseError, CaseService
+from .services.gateway_pool import GatewayPool
 from .services.llm_judge import LlmJudge
-from .services.patrol import Patrol, PatrolSettings
+from .services.patrol import Patrol
 from .services.render import (
     FORUM_CHARS,
     TITLE_CHARS,
@@ -40,142 +43,87 @@ from .services.render import (
     format_report,
     one_line,
 )
-from .services.tieba_gateway import TiebaGateway
+from .services.settings_service import SettingsError, SettingsService
+from .web.route_table import route_table
 from .web.routes import WebRoutes, WebServices
+from .web.settings_routes import (
+    SettingsRoutes,
+    SettingsWebServices,
+    provider_rows,
+)
 
 PLUGIN_NAME = "astrbot_plugin_tieba_moderator"
 DB_FILE = "moderator.db"
-MIN_INTERVAL_SECONDS = 60
 STARTUP_DELAY_SECONDS = 30
 """Give the messaging platforms time to connect before the first push."""
 LIST_LIMIT = 20
 DAYS_TEXT = "|".join(str(d) for d in ALLOWED_BAN_DAYS)
-NO_ACCOUNT_REPLY = "未配置吧务账号的 BDUSS / STOKEN，巡查和贴吧操作不可用。"
+NO_ACCOUNT_REPLY = "未配置可用的吧务账号，请在插件页设置。"
 NO_PERMISSION_REPLY = (
     "你没有处理案件的权限（需要 AstrBot 管理员、全局操作员，或该吧的吧务）。"
 )
 ADMIN_ONLY_REPLY = "该指令只有 AstrBot 管理员可以使用。"
 
 
-def _clamp_number(raw: object, default: float, low: float, high: float) -> float:
-    """Coerce a config value to a number inside ``[low, high]``.
-
-    Args:
-        raw: Value from the config.
-        default: Used when the value is not a number.
-        low: Lower bound.
-        high: Upper bound.
-
-    Returns:
-        The clamped value.
-    """
-    try:
-        value = float(raw)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        value = default
-    if value != value:  # NaN
-        value = default
-    return min(high, max(low, value))
-
-
-def _parse_id(raw: str) -> int | None:
-    """Parse a positive id argument that fits in SQLite's INTEGER.
-
-    Args:
-        raw: The raw command argument.
-
-    Returns:
-        The id, or None when it is not a positive decimal integer.
-    """
-    raw = raw.strip()
-    if not raw.isdecimal() or len(raw) > 18 or int(raw) <= 0:
-        return None
-    return int(raw)
-
-
 class TiebaModeratorPlugin(Star):
     """Patrol Tieba forums and let an LLM flag rule-breaking content."""
 
-    def __init__(self, context: Context, config: AstrBotConfig) -> None:
-        """Parse and clamp the config; resources are opened in ``initialize``.
+    def __init__(self, context: Context, config=None) -> None:
+        """Register commands and routes without reading AstrBot configuration.
 
         Args:
             context: The star context.
-            config: The plugin config.
+            config: Ignored; retained only for AstrBot's constructor convention.
         """
-        super().__init__(context, config)
-        self.config = config
-        account = config.get("account") or {}
-        patrol = config.get("patrol") or {}
-        judge = config.get("judge") or {}
-        action = config.get("action") or {}
-
-        self._bduss = str(account.get("bduss") or "").strip()
-        self._stoken = str(account.get("stoken") or "").strip()
-        self._enabled = bool(patrol.get("enabled", True))
-        self._interval = int(
-            _clamp_number(
-                patrol.get("interval_seconds"), 180, MIN_INTERVAL_SECONDS, 86400
-            )
-        )
-
-        auto_threshold = _clamp_number(action.get("auto_delete_threshold"), 0.9, 0, 1)
-        report_threshold = _clamp_number(action.get("report_threshold"), 0.6, 0, 1)
-        if report_threshold > auto_threshold:
-            logger.warning(
-                f"report_threshold {report_threshold} is above auto_delete_threshold "
-                f"{auto_threshold}; using {auto_threshold} for both."
-            )
-            report_threshold = auto_threshold
-
-        self._forum_config, warnings = parse_forum_config(config)
-        for warning in warnings:
-            logger.warning(warning)
-        whitelist = [str(w).strip() for w in patrol.get("whitelist") or []]
-        review_images = bool(judge.get("review_images", True))
-        max_images = int(_clamp_number(judge.get("max_images"), 4, 0, 9))
-        self._settings = PatrolSettings(
-            forums=self._forum_config.forums,
-            thread_pages=int(_clamp_number(patrol.get("thread_pages"), 1, 1, 5)),
-            lookback_hours=int(_clamp_number(patrol.get("lookback_hours"), 6, 1, 168)),
-            review_posts=bool(patrol.get("review_posts", True)),
-            review_comments=bool(patrol.get("review_comments", True)),
-            skip_top_and_good=bool(patrol.get("skip_top_and_good", True)),
-            skip_bawu=bool(patrol.get("skip_bawu", True)),
-            whitelist=frozenset(w for w in whitelist if w),
-            max_items_per_round=int(
-                _clamp_number(patrol.get("max_items_per_round"), 60, 1, 500)
-            ),
-            review_images=review_images,
-            max_images=max_images,
-            judge_concurrency=int(_clamp_number(judge.get("concurrency"), 2, 1, 8)),
-            auto_delete_enabled=bool(action.get("auto_delete", False)),
-            auto_delete_threshold=auto_threshold,
-            report_threshold=report_threshold,
-        )
-        self._judge = LlmJudge(
-            context,
-            provider_id=str(judge.get("provider_id") or ""),
-            rules=self._forum_config.default_rules,
-            forum_rules={
-                key: profile.rules
-                for key, profile in self._forum_config.profiles.items()
-            },
-            timeout_seconds=_clamp_number(judge.get("timeout_seconds"), 60, 10, 600),
-            review_images=review_images,
-            max_images=max_images,
-        )
-
+        super().__init__(context)
+        self._settings_service: SettingsService | None = None
         self._store: Store | None = None
-        self._gateway: TiebaGateway | None = None
+        self._pool: GatewayPool | None = None
+        self._judge: LlmJudge | None = None
         self._patrol: Patrol | None = None
         self._cases: CaseService | None = None
         self._task: asyncio.Task | None = None
         self._manual_task: asyncio.Task | None = None
-        """Background manual round, shared by ``/tb run`` and ``POST patrol/run``."""
+        self._loop_wakeup = asyncio.Event()
+        self._terminating = False
         self._last_report: PatrolReport | None = None
+        self._secrets: set[str] = set()
+        """Every credential seen since process start, including replaced ones.
+
+        Redaction must cover a credential that is no longer in the settings: an
+        error raised while it was current can still be logged later, and an
+        aiotieba ValueError echoes the offending value in full.
+        """
         self._web = WebRoutes(self._web_services)
+        self._settings_web = SettingsRoutes(self._settings_web_services)
         self._register_web_apis()
+
+    def _snapshot(self) -> SettingsSnapshot:
+        """Read the current settings, including before storage is initialized."""
+        if self._settings_service is not None:
+            return self._settings_service.snapshot()
+        return SettingsSnapshot(global_=default_global_settings())
+
+    @property
+    def _forum_config(self) -> ForumConfig:
+        """Build the permission and notification view from current settings."""
+        return ForumConfig.from_snapshot(self._snapshot())
+
+    @property
+    def _enabled(self) -> bool:
+        return self._snapshot().global_.patrol_enabled
+
+    @property
+    def _interval(self) -> int:
+        return self._snapshot().global_.interval_seconds
+
+    def _can_patrol(self) -> bool:
+        """Whether at least one enabled forum has a usable account."""
+        return self._pool is not None and any(
+            forum.enabled and self._pool.get(forum.account_id) is not None
+            for forum in self._snapshot().forums
+            if forum.account_id is not None
+        )
 
     # ------------------------------------------------------------------
     # Dashboard plugin view
@@ -198,37 +146,7 @@ class TiebaModeratorPlugin(Star):
                 "routes are not registered."
             )
             return
-        web = self._web
-        routes: tuple[tuple[str, object, list[str], str], ...] = (
-            ("status", web.get_status, ["GET"], "Patrol status"),
-            ("cases", web.get_cases, ["GET"], "List cases"),
-            ("cases/<case_id>", web.get_case, ["GET"], "Get one case"),
-            (
-                "cases/<case_id>/images/<index>",
-                web.get_case_image,
-                ["GET"],
-                "Get one case image",
-            ),
-            (
-                "cases/<case_id>/delete",
-                web.post_delete,
-                ["POST"],
-                "Delete case content",
-            ),
-            ("cases/<case_id>/ban", web.post_ban, ["POST"], "Delete and ban"),
-            ("cases/<case_id>/ignore", web.post_ignore, ["POST"], "Ignore case"),
-            (
-                "cases/<case_id>/restore",
-                web.post_restore,
-                ["POST"],
-                "Restore case content",
-            ),
-            ("stats", web.get_stats, ["GET"], "Case statistics"),
-            ("reports", web.get_reports, ["GET"], "Patrol reports"),
-            ("patrol/run", web.post_patrol_run, ["POST"], "Start a patrol round"),
-            ("check", web.post_check, ["POST"], "Trial review of a thread"),
-        )
-        for path, handler, methods, desc in routes:
+        for path, handler, methods, desc in route_table(self._web, self._settings_web):
             register(f"/{PLUGIN_NAME}/{path}", handler, methods, desc)
 
     @property
@@ -238,6 +156,21 @@ class TiebaModeratorPlugin(Star):
         Derived from the task so there is a single source of truth.
         """
         return self._manual_task is not None and not self._manual_task.done()
+
+    def _settings_web_services(self) -> SettingsWebServices:
+        """Read the current dependencies for a settings Web API call.
+
+        Returns:
+            A snapshot of the live services, including a provider lister bound
+            to the current AstrBot context.
+        """
+        return SettingsWebServices(
+            settings=self._settings_service,
+            pools=self._pool,
+            list_providers=lambda: provider_rows(self.context),
+            redact=lambda exc: self._redact(exc, brief=True),
+            redact_trace=self._redact,
+        )
 
     def _web_services(self) -> WebServices:
         """Read the current dependencies for a Web API call.
@@ -249,10 +182,10 @@ class TiebaModeratorPlugin(Star):
         return WebServices(
             store=self._store,
             patrol=self._patrol,
-            gateway=self._gateway,
+            pool=self._pool,
             cases=self._cases,
             judge=self._judge,
-            settings=self._settings,
+            settings=self._snapshot(),
             interval_seconds=self._interval,
             patrol_enabled=self._enabled,
             loop_running=self._task is not None and not self._task.done(),
@@ -267,48 +200,60 @@ class TiebaModeratorPlugin(Star):
     # ------------------------------------------------------------------
 
     async def initialize(self) -> None:
-        """Open the store, build the services and start the patrol loop."""
+        """Load plugin settings and construct services even when unconfigured."""
         self._store = Store(StarTools.get_data_dir(PLUGIN_NAME) / DB_FILE)
-        if not self._bduss or not self._stoken:
-            logger.warning(
-                "Tieba credentials are missing (account.bduss / account.stoken); "
-                "the patrol is not started."
-            )
-            return
-        try:
-            self._gateway = TiebaGateway(self._bduss, self._stoken)
-        except ValueError:
-            # aiotieba echoes the offending secret in its ValueError message, so
-            # neither the message nor the traceback may be logged.
-            logger.error(
-                "account.bduss / account.stoken 格式不正确，"
-                "请重新从浏览器 Cookie 复制值本身，不要带 BDUSS= 前缀或引号；"
-                "巡查和贴吧操作已停用。"
-            )
-            return
+        snapshot = self._store.load_settings()
+        self._learn_credentials(snapshot)
+        self._settings_service = SettingsService(
+            self._store, snapshot=snapshot, on_change=self._on_settings_change
+        )
+        self._pool = GatewayPool(snapshot)
+        self._judge = LlmJudge(self.context, settings=self._settings_service)
         self._patrol = Patrol(
-            gateway=self._gateway,
+            pool=self._pool,
             store=self._store,
             judge=self._judge,
             notify=self._notify,
-            settings=self._settings,
+            settings=self._settings_service,
+            scrub=self._scrub,
         )
-        self._cases = CaseService(gateway=self._gateway, store=self._store)
-        if not self._settings.forums:
-            logger.warning("No forums configured; the patrol is not started.")
-            return
-        if not self._enabled:
-            logger.info("Patrol is disabled in the config; commands still work.")
-            return
-        self._task = asyncio.create_task(self._patrol_loop())
-        logger.info(
-            f"Tieba patrol started: forums={list(self._settings.forums)}, "
-            f"interval={self._interval}s, "
-            f"auto_delete={self._settings.auto_delete_enabled}"
+        self._cases = CaseService(
+            pool=self._pool, settings=self._settings_service, store=self._store
         )
+        if not self._can_patrol():
+            logger.info("No patrol-ready forums; waiting for plugin settings.")
+        elif self._enabled:
+            self._task = asyncio.create_task(self._patrol_loop(STARTUP_DELAY_SECONDS))
+
+    async def _on_settings_change(
+        self, old: SettingsSnapshot, new: SettingsSnapshot
+    ) -> None:
+        """Refresh clients, then restart scheduling without cancelling a round.
+
+        The callback never waits for a round: it may be holding the settings
+        write lock. The loop owns its successor and starts a fresh interval
+        after the current round releases its pinned gateways.
+        """
+        # Harvest before any client is rebuilt, so a construction error is
+        # already redactable when it is logged.
+        self._learn_credentials(new)
+        if self._pool is not None:
+            await self._pool.update(new)
+        schedule_changed = (
+            old.global_.patrol_enabled != new.global_.patrol_enabled
+            or old.global_.interval_seconds != new.global_.interval_seconds
+            or not self._can_patrol()
+        )
+        if self._task is not None and not self._task.done():
+            if schedule_changed:
+                self._loop_wakeup.set()
+        elif not self._terminating and self._enabled and self._can_patrol():
+            self._loop_wakeup = asyncio.Event()
+            self._task = asyncio.create_task(self._patrol_loop(0))
 
     async def terminate(self) -> None:
-        """Stop the loops and release the gateway and the store."""
+        """Stop patrol tasks, drain gateway users, then close the store."""
+        self._terminating = True
         for name, task in (
             ("manual patrol", self._manual_task),
             ("patrol", self._task),
@@ -323,28 +268,39 @@ class TiebaModeratorPlugin(Star):
                     logger.warning(
                         f"The {name} task ended with an error:\n{self._redact(exc)}"
                     )
-        self._task = None
-        self._manual_task = None
-        if self._gateway is not None:
+        self._task = self._manual_task = None
+        if self._pool is not None:
             try:
-                await self._gateway.close()
+                await self._pool.close()
             except Exception as exc:
-                logger.warning(f"Failed to close Tieba gateway:\n{self._redact(exc)}")
-            self._gateway = None
+                logger.warning(f"Failed to close Tieba pool:\n{self._redact(exc)}")
+            self._pool = None
         if self._store is not None:
             self._store.close()
             self._store = None
 
-    async def _patrol_loop(self) -> None:
-        """Run a patrol round every ``interval`` seconds until cancelled."""
-        await asyncio.sleep(STARTUP_DELAY_SECONDS)
-        while True:
-            try:
-                report = await self._patrol.run_once()
-                self._finish_round(report)
-            except Exception as exc:
-                logger.error(f"Patrol round failed:\n{self._redact(exc)}")
-            await asyncio.sleep(self._interval)
+    async def _patrol_loop(self, delay: float = STARTUP_DELAY_SECONDS) -> None:
+        """Wait interruptibly, but let an active round finish on settings edits."""
+        try:
+            while True:
+                try:
+                    await asyncio.wait_for(self._loop_wakeup.wait(), timeout=delay)
+                    return
+                except TimeoutError:
+                    pass
+                try:
+                    report = await self._patrol.run_once()
+                    self._finish_round(report)
+                except Exception as exc:
+                    logger.error(f"Patrol round failed:\n{self._redact(exc)}")
+                if self._loop_wakeup.is_set():
+                    return
+                delay = self._interval
+        finally:
+            self._task = None
+            if not self._terminating and self._enabled and self._can_patrol():
+                self._loop_wakeup = asyncio.Event()
+                self._task = asyncio.create_task(self._patrol_loop(self._interval))
 
     def _finish_round(self, report: PatrolReport) -> None:
         """Remember a finished round and persist its summary.
@@ -352,6 +308,10 @@ class TiebaModeratorPlugin(Star):
         Args:
             report: The report of the round that just finished.
         """
+        report = dcs.replace(
+            report,
+            errors=tuple(self._scrub(error) for error in report.errors),
+        )
         self._last_report = report
         if report.errors:
             logger.warning(f"Patrol round finished:\n{format_report(report)}")
@@ -395,7 +355,7 @@ class TiebaModeratorPlugin(Star):
         return report
 
     def _redact(self, exc: BaseException, *, brief: bool = False) -> str:
-        """Format an exception with credentials removed.
+        """Format an exception with every known credential removed.
 
         Args:
             exc: The exception.
@@ -405,11 +365,39 @@ class TiebaModeratorPlugin(Star):
         Returns:
             Text with any BDUSS / STOKEN value replaced by ``***``.
         """
-        text = str(exc) if brief else "".join(traceback.format_exception(exc))
-        for secret in (self._bduss, self._stoken):
-            if secret:
-                text = text.replace(secret, "***")
+        return self._scrub(
+            str(exc) if brief else "".join(traceback.format_exception(exc))
+        )
+
+    def _scrub(self, text: str) -> str:
+        """Replace every credential this process has loaded with ``***``.
+
+        Longest first, so a credential that contains another as a prefix cannot
+        leave a fragment behind.
+
+        Args:
+            text: Any text that may quote an exception or a request.
+
+        Returns:
+            The text with each known credential removed.
+        """
+        for secret in sorted(self._secrets, key=len, reverse=True):
+            text = text.replace(secret, "***")
         return text
+
+    def _learn_credentials(self, snapshot: SettingsSnapshot) -> None:
+        """Remember credentials from a snapshot for later redaction.
+
+        The set only grows: a credential removed from the settings may still be
+        inside an exception object that is logged afterwards.
+
+        Args:
+            snapshot: Settings to harvest account credentials from.
+        """
+        for account in snapshot.accounts:
+            for value in (account.bduss, account.stoken):
+                if value:
+                    self._secrets.add(value)
 
     async def _notify(self, case: Case) -> None:
         """Push a new case to every bound session, as plain text only.
@@ -494,34 +482,39 @@ class TiebaModeratorPlugin(Star):
     @tb.command("status")
     async def tb_status(self, event: AstrMessageEvent):
         """查看巡查状态、上一轮报告和待处理数"""
-        if self._patrol is None:
-            state = "未运行（缺少账号凭据）"
-        elif self._task is not None and not self._task.done():
+        snapshot = self._snapshot()
+        if self._task is not None and not self._task.done():
             state = f"运行中，每 {self._interval} 秒一轮"
         elif not self._enabled:
             state = "定时巡查已关闭（可用 /tb run 手动巡查）"
         else:
-            state = "未运行（没有配置吧名）"
-        s = self._settings
-        auto = (
-            f"开启（阈值 {s.auto_delete_threshold:.2f}）"
-            if s.auto_delete_enabled
-            else "关闭"
-        )
-        forums = []
-        for fname in self._forum_config.forums:
-            profile = self._forum_config.profile(fname)
+            state = "未运行（没有可巡查的吧）"
+        names = {account.id: account.name for account in snapshot.accounts}
+        lines = [f"巡查：{state}"]
+        for forum in snapshot.forums:
+            resolved = resolve(snapshot, forum.fname)
+            problem = (
+                "已停用"
+                if not forum.enabled
+                else ("未选择账号" if forum.account_id is None else "可巡查")
+            )
+            options = resolved.options
+            account_name = names.get(forum.account_id, "未选择")
+            auto = "开启" if options.auto_delete_enabled else "关闭"
             labels = []
-            if profile.rules_overridden:
+            if forum.overrides.rules:
                 labels.append("独立吧规")
-            if profile.sessions_overridden:
+            if forum.sessions:
                 labels.append("独立推送")
-            forums.append(fname + (f"（{'、'.join(labels)}）" if labels else ""))
-        lines = [
-            f"巡查：{state}",
-            f"吧：{'、'.join(forums) or '未配置'}",
-            f"自动删除：{auto} | 上报阈值 {s.report_threshold:.2f}",
-        ]
+            lines.append(
+                f"{one_line(forum.fname, FORUM_CHARS)} 吧：{problem} | "
+                f"账号：{one_line(account_name, 32)} | 自动删除：{auto}"
+                f"（阈值 {options.auto_delete_threshold:.2f}） | "
+                f"上报阈值 {options.report_threshold:.2f}"
+                + (f" | {'、'.join(labels)}" if labels else "")
+            )
+        if not snapshot.forums:
+            lines.append("吧：未配置，请在插件页设置。")
         scope = self._scope(event)
         if self._store is not None:
             lines.append(f"待处理案件：{pending_count(self._store, scope)}")
@@ -543,11 +536,11 @@ class TiebaModeratorPlugin(Star):
             # One round covers every forum, so local moderators may not start it.
             yield event.plain_result(NO_PERMISSION_REPLY)
             return
-        if self._patrol is None:
+        if self._pool is None or self._pool.any() is None:
             yield event.plain_result(NO_ACCOUNT_REPLY)
             return
-        if not self._settings.forums:
-            yield event.plain_result("没有配置要巡查的吧。")
+        if not self._can_patrol():
+            yield event.plain_result("没有配置可巡查的吧。")
             return
         if not self._start_manual_patrol():
             yield event.plain_result("已有一轮手动巡查在进行，请稍后。")
@@ -598,7 +591,7 @@ class TiebaModeratorPlugin(Star):
         if not scope.any:
             yield event.plain_result(NO_PERMISSION_REPLY)
             return
-        cid = _parse_id(case_id)
+        cid = parse_case_id(case_id)
         if cid is None:
             yield event.plain_result("用法：/tb show <案件编号>，编号是正整数。")
             return
@@ -662,7 +655,7 @@ class TiebaModeratorPlugin(Star):
             if op == "ban"
             else f"/tb {op} <案件编号>"
         )
-        cid = _parse_id(case_id)
+        cid = parse_case_id(case_id)
         if cid is None:
             yield event.plain_result(f"用法：{usage}，编号是正整数。")
             return
@@ -724,21 +717,26 @@ class TiebaModeratorPlugin(Star):
         if not event.is_admin():
             yield event.plain_result(ADMIN_ONLY_REPLY)
             return
-        thread_id = _parse_id(tid)
+        thread_id = parse_case_id(tid)
         if thread_id is None:
             yield event.plain_result("用法：/tb check <帖子 tid>，tid 是正整数。")
             return
-        if self._gateway is None:
+        if self._pool is None or self._pool.any() is None:
             yield event.plain_result(NO_ACCOUNT_REPLY)
             return
         try:
-            item = await self._gateway.get_thread_item_by_tid(thread_id)
-            urls: list[str] = []
-            if self._settings.review_images and item.image_urls:
-                urls = await self._gateway.fetch_images(
-                    item.image_urls, self._settings.max_images
-                )
-            verdict = await self._judge(item, urls)
+            async with self._pool.lease() as gateway:
+                if gateway is None:
+                    yield event.plain_result(NO_ACCOUNT_REPLY)
+                    return
+                item = await gateway.get_thread_item_by_tid(thread_id)
+                settings = self._snapshot().global_
+                urls: list[str] = []
+                if settings.review_images and item.image_urls:
+                    urls = await gateway.fetch_images(
+                        item.image_urls, settings.max_images
+                    )
+                verdict = await self._judge(item, urls)
         except (JudgeError, ImageFetchError, TiebaActionError) as exc:
             yield event.plain_result(f"审查失败：{self._redact(exc, brief=True)}")
             return
@@ -746,7 +744,7 @@ class TiebaModeratorPlugin(Star):
             logger.error(f"Check of thread {thread_id} failed:\n{self._redact(exc)}")
             yield event.plain_result("审查失败，详见 AstrBot 日志。")
             return
-        s = self._settings
+        s = resolve(self._snapshot(), item.fname).options
         action = decide_action(
             verdict,
             auto_delete_enabled=s.auto_delete_enabled,
@@ -774,16 +772,19 @@ class TiebaModeratorPlugin(Star):
         if not event.is_admin():
             yield event.plain_result(ADMIN_ONLY_REPLY)
             return
-        result = bind_session(
-            self.config, self._forum_config, fname.strip(), event.unified_msg_origin
-        )
+        if self._settings_service is None:
+            yield event.plain_result("插件存储尚未就绪，请稍后重试。")
+            return
+        try:
+            result = await self._settings_service.bind_session(
+                fname.strip() or None, event.unified_msg_origin
+            )
+        except SettingsError as exc:
+            yield event.plain_result(str(exc))
+            return
         if isinstance(result, str):
             yield event.plain_result(result)
             return
-        self.config.save_config()
-        self._forum_config, warnings = parse_forum_config(self.config)
-        for warning in warnings:
-            logger.warning(warning)
         yield event.plain_result(
             f"已把当前会话加入{result.label}推送列表，共 {result.total} 个。"
         )

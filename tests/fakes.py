@@ -86,18 +86,6 @@ class FakeGateway:
         self.close = AsyncMock()
 
 
-class FakeConfig(dict):
-    """Keep config persistence observable without reading or writing credentials."""
-
-    def __init__(self, **values) -> None:
-        super().__init__(values)
-        self.saves = 0
-
-    def save_config(self) -> None:
-        """Record a save without filesystem access."""
-        self.saves += 1
-
-
 class FakeEvent:
     """Command event with a local plain-text reply surface."""
 

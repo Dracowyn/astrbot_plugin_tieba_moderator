@@ -43,11 +43,19 @@ from ..core.models import (
     TiebaActionError,
     decide_action,
 )
+from ..core.settings import SettingsSnapshot, resolve
 from ..core.store import Store
 from ..services.case_service import CaseError, CaseService
+from ..services.gateway_pool import GatewayPool
 from ..services.llm_judge import MAX_TEMP_RULES_CHARS, LlmJudge
-from ..services.patrol import Patrol, PatrolSettings
-from ..services.tieba_gateway import TiebaGateway
+from ..services.patrol import Patrol
+from .stats import (
+    CASE_STATUSES,
+    DEFAULT_STATS_DAYS,
+    MAX_STATS_DAYS,
+    _forum_stats_rows,
+    _stats_payload,
+)
 
 MAX_ID_DIGITS = 18
 MAX_INDEX = 8
@@ -56,8 +64,6 @@ MAX_FILTER_CHARS = 64
 MAX_OFFSET = 1_000_000
 MAX_LIMIT = 100
 DEFAULT_LIMIT = 20
-MAX_STATS_DAYS = 90
-DEFAULT_STATS_DAYS = 30
 IMAGE_CACHE_SIZE = 64
 """Maximum number of cached image data URLs."""
 IMAGE_CACHE_MAX_CHARS = 32 * 1024 * 1024
@@ -76,10 +82,8 @@ NO_ACCOUNT_REPLY = "未配置吧务账号的 BDUSS / STOKEN，贴吧操作不可
 BUSY_PATROL_REPLY = "已有一轮手动巡查在进行，请稍后。"
 BUSY_CHECK_REPLY = "已有一次试判在进行，请稍后。"
 
-CASE_STATUSES = {status.value: status for status in CaseStatus}
 CASE_KINDS = {kind.value: kind for kind in ItemKind}
 _STATUS_QUERY_KEYS = ("status", "status[]")
-_BUCKETS = 10
 
 
 @dcs.dataclass(frozen=True, kw_only=True)
@@ -92,13 +96,13 @@ class WebServices:
 
     Attributes:
         store: Case persistence, None before ``initialize``.
-        patrol: Patrol runner, None when no account is configured.
-        gateway: Tieba gateway, None when no account is configured.
-        cases: Moderator actions, None when no account is configured.
+        patrol: Patrol runner, None before initialization.
+        pool: Account gateways, None before initialization.
+        cases: Moderator actions, None before initialization.
         judge: The LLM judge, including its temporary-rules entry point.
-        settings: Effective patrol settings.
+        settings: Immutable settings snapshot for this request.
         interval_seconds: Configured patrol interval.
-        patrol_enabled: Whether the periodic loop is enabled in the config.
+        patrol_enabled: Whether the periodic loop is enabled.
         loop_running: Whether the periodic loop task is alive right now.
         manual_running: Whether a manual round is in flight.
         start_patrol: Starts a manual round; False when one is already running.
@@ -108,10 +112,10 @@ class WebServices:
 
     store: Store | None
     patrol: Patrol | None
-    gateway: TiebaGateway | None
+    pool: GatewayPool | None
     cases: CaseService | None
-    judge: LlmJudge
-    settings: PatrolSettings
+    judge: LlmJudge | None
+    settings: SettingsSnapshot
     interval_seconds: int
     patrol_enabled: bool
     loop_running: bool
@@ -318,76 +322,6 @@ def _report_dto(report: PatrolReport) -> dict[str, Any]:
     }
 
 
-def _bucket_index(confidence: float) -> int:
-    """Map a confidence to its 0.1-wide bucket.
-
-    Args:
-        confidence: Confidence in ``[0, 1]``.
-
-    Returns:
-        The bucket index, 0 to 9. The epsilon keeps values such as 0.7 (stored
-        as 6.999999999999999 when multiplied) in the expected bucket.
-    """
-    return min(_BUCKETS - 1, max(0, int(confidence * _BUCKETS + 1e-9)))
-
-
-def _stats_payload(
-    rows: list[tuple[str, CaseStatus, float]], since: int
-) -> dict[str, Any]:
-    """Aggregate raw case rows into the statistics payload.
-
-    Args:
-        rows: ``(category, status, confidence)`` triples from the store.
-        since: Unix seconds the statistics start at.
-
-    Returns:
-        The ``GET stats`` payload. Cases whose category is ``审查失败`` are
-        counted in ``review_failed`` and excluded from ``by_category`` and the
-        confidence buckets, because they carry no judge confidence at all.
-    """
-    status_counts = {status.value: 0 for status in CaseStatus}
-    categories: dict[str, dict[str, Any]] = {}
-    buckets = [
-        {
-            "low": index / _BUCKETS,
-            "high": (index + 1) / _BUCKETS,
-            "total": 0,
-            "confirmed": 0,
-            "false_positive": 0,
-        }
-        for index in range(_BUCKETS)
-    ]
-    review_failed = 0
-    for category, status, confidence in rows:
-        status_counts[status.value] += 1
-        if category == FAILED_CATEGORY:
-            review_failed += 1
-            continue
-        entry = categories.get(category)
-        if entry is None:
-            entry = {"category": category, "total": 0}
-            entry.update(dict.fromkeys(CASE_STATUSES, 0))
-            categories[category] = entry
-        entry["total"] += 1
-        entry[status.value] += 1
-        bucket = buckets[_bucket_index(confidence)]
-        bucket["total"] += 1
-        if status in (CaseStatus.DELETED, CaseStatus.BANNED, CaseStatus.AUTO_DELETED):
-            bucket["confirmed"] += 1
-        elif status in (CaseStatus.IGNORED, CaseStatus.RESTORED):
-            bucket["false_positive"] += 1
-    return {
-        "since": since,
-        "total": len(rows),
-        "by_status": status_counts,
-        "by_category": sorted(
-            categories.values(), key=lambda row: (-row["total"], row["category"])
-        ),
-        "confidence_buckets": buckets,
-        "review_failed": review_failed,
-    }
-
-
 class WebRoutes:
     """Dashboard plugin-view handlers for one plugin instance."""
 
@@ -416,25 +350,54 @@ class WebRoutes:
     # ------------------------------------------------------------------
 
     async def get_status(self) -> Any:
-        """Return patrol state, thresholds and the newest report."""
+        """Return patrol state, per-forum status and the newest report.
+
+        Top-level thresholds are the global defaults (``docs/settings.md``
+        §4.1); each forum entry carries its own resolved values.
+        """
         services = self._services()
         if services.store is None:
             return error_response(NO_STORE_REPLY, status_code=503)
         reports = services.store.list_reports(1)
-        settings = services.settings
+        snapshot = services.settings
+        defaults = snapshot.global_.defaults
+        names = {account.id: account.name for account in snapshot.accounts}
+        forums = []
+        for entry in snapshot.forums:
+            resolved = resolve(snapshot, entry.fname)
+            if not entry.enabled:
+                problem = "已停用"
+            elif entry.account_id is None:
+                problem = "未选择账号"
+            else:
+                problem = ""
+            forums.append(
+                {
+                    "fname": entry.fname,
+                    "patrolled": resolved.enabled and resolved.account_id is not None,
+                    "problem": problem,
+                    "account_name": names.get(entry.account_id, ""),
+                    "auto_delete": {
+                        "enabled": resolved.options.auto_delete_enabled,
+                        "threshold": resolved.options.auto_delete_threshold,
+                    },
+                    "report_threshold": resolved.options.report_threshold,
+                }
+            )
         return json_response(
             {
-                "has_account": services.gateway is not None,
+                "has_account": bool(snapshot.accounts),
+                "configured": any(forum["patrolled"] for forum in forums),
                 "patrol_enabled": services.patrol_enabled,
                 "loop_running": services.loop_running,
                 "manual_running": services.manual_running,
                 "interval_seconds": services.interval_seconds,
-                "forums": list(settings.forums),
+                "forums": forums,
                 "auto_delete": {
-                    "enabled": settings.auto_delete_enabled,
-                    "threshold": settings.auto_delete_threshold,
+                    "enabled": defaults.auto_delete_enabled,
+                    "threshold": defaults.auto_delete_threshold,
                 },
-                "report_threshold": settings.report_threshold,
+                "report_threshold": defaults.report_threshold,
                 "pending": services.store.count_cases(CaseStatus.PENDING),
                 "last_report": _report_dto(reports[0]) if reports else None,
             }
@@ -537,7 +500,7 @@ class WebRoutes:
         urls = case.item.image_urls
         if image_index >= len(urls):
             return error_response("图片序号不存在", status_code=404)
-        if services.gateway is None:
+        if services.pool is None or services.pool.any() is None:
             return error_response(NO_ACCOUNT_REPLY, status_code=503)
 
         key = f"{cid}:{image_index}"
@@ -546,7 +509,11 @@ class WebRoutes:
             self._image_cache.move_to_end(key)
             return json_response({"data_url": cached})
         try:
-            data_urls = await services.gateway.fetch_images([urls[image_index]], 1)
+            async with services.pool.lease() as gateway:
+                if gateway is None:
+                    # Every account may have been deleted since the pre-check.
+                    return error_response(NO_ACCOUNT_REPLY, status_code=503)
+                data_urls = await gateway.fetch_images([urls[image_index]], 1)
         except ImageFetchError as exc:
             return error_response(
                 services.redact(exc) or "图片下载失败", status_code=502
@@ -692,8 +659,14 @@ class WebRoutes:
             days = int(text)
             if not 1 <= days <= MAX_STATS_DAYS:
                 return error_response(f"days 必须是 1 到 {MAX_STATS_DAYS} 的整数")
+        fname = (request.query.get("fname") or "").strip()
+        if len(fname) > MAX_FILTER_CHARS:
+            return error_response("fname 过长")
         since = int(self._clock()) - days * 86400
-        rows = services.store.case_stats(since)
+        if fname:
+            rows = _forum_stats_rows(services.store, fname.strip().casefold(), since)
+        else:
+            rows = services.store.case_stats(since)
         return json_response(_stats_payload(rows, since))
 
     async def get_reports(self) -> Any:
@@ -722,7 +695,11 @@ class WebRoutes:
         services = self._services()
         if services.store is None:
             return error_response(NO_STORE_REPLY, status_code=503)
-        if services.patrol is None:
+        if (
+            services.patrol is None
+            or services.pool is None
+            or services.pool.any() is None
+        ):
             return error_response(NO_ACCOUNT_REPLY, status_code=503)
         if not services.start_patrol():
             return error_response(BUSY_PATROL_REPLY, status_code=409)
@@ -748,21 +725,24 @@ class WebRoutes:
             return error_response("rules 必须是字符串")
         if len(rules) > MAX_TEMP_RULES_CHARS:
             return error_response(f"临时吧规不能超过 {MAX_TEMP_RULES_CHARS} 字")
-        if services.gateway is None:
+        if services.pool is None or services.pool.any() is None:
             return error_response(NO_ACCOUNT_REPLY, status_code=503)
         if self._check_lock.locked():
             return error_response(BUSY_CHECK_REPLY, status_code=409)
 
         async with self._check_lock:
-            settings = services.settings
+            settings = services.settings.global_
             try:
-                item = await services.gateway.get_thread_item_by_tid(tid)
-                urls: list[str] = []
-                if settings.review_images and item.image_urls:
-                    urls = await services.gateway.fetch_images(
-                        item.image_urls, settings.max_images
-                    )
-                verdict = await services.judge.judge_with_rules(item, urls, rules)
+                async with services.pool.lease() as gateway:
+                    if gateway is None:
+                        return error_response(NO_ACCOUNT_REPLY, status_code=503)
+                    item = await gateway.get_thread_item_by_tid(tid)
+                    urls: list[str] = []
+                    if settings.review_images and item.image_urls:
+                        urls = await gateway.fetch_images(
+                            item.image_urls, settings.max_images
+                        )
+                    verdict = await services.judge.judge_with_rules(item, urls, rules)
             except (JudgeError, ImageFetchError, TiebaActionError) as exc:
                 return error_response(
                     services.redact(exc) or "审查失败", status_code=502
@@ -773,17 +753,26 @@ class WebRoutes:
                 )
                 return error_response(INTERNAL_ERROR, status_code=500)
 
+        options = resolve(services.settings, item.fname).options
         action = decide_action(
             verdict,
-            auto_delete_enabled=settings.auto_delete_enabled,
-            auto_delete_threshold=settings.auto_delete_threshold,
-            report_threshold=settings.report_threshold,
+            auto_delete_enabled=options.auto_delete_enabled,
+            auto_delete_threshold=options.auto_delete_threshold,
+            report_threshold=options.report_threshold,
         )
         return json_response(
             {
                 "item": _item_dto(item),
+                "fname": item.fname,
                 "verdict": _verdict_dto(verdict),
                 "action": action.value,
+                "thresholds": {
+                    "auto_delete": {
+                        "enabled": options.auto_delete_enabled,
+                        "threshold": options.auto_delete_threshold,
+                    },
+                    "report_threshold": options.report_threshold,
+                },
                 "images_reviewed": len(urls),
                 "images_total": len(item.image_urls),
             }

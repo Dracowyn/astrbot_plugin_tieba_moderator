@@ -2,6 +2,7 @@
 
 import asyncio
 import dataclasses as dcs
+from contextlib import asynccontextmanager
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -22,13 +23,16 @@ from astrbot_plugin_tieba_moderator.core.models import (
     Verdict,
 )
 from astrbot_plugin_tieba_moderator.services.case_service import CaseError
-from astrbot_plugin_tieba_moderator.services.patrol import PatrolSettings
+from astrbot_plugin_tieba_moderator.core.settings import (
+    Account, ForumEntry, SettingsSnapshot, default_global_settings,
+)
+from astrbot_plugin_tieba_moderator.services.gateway_pool import GatewayPool
 from astrbot_plugin_tieba_moderator.web import routes as web
 
 CASE_STATUS_NAMES = [status.value for status in CaseStatus]
 from astrbot_plugin_tieba_moderator.web.routes import WebRoutes, WebServices
 
-from astrbot_plugin_tieba_moderator.tests.fakes import FakeConfig, FakeGateway, make_item
+from astrbot_plugin_tieba_moderator.tests.fakes import FakeGateway, make_item
 
 
 # --- request stand-in -------------------------------------------------------
@@ -131,10 +135,12 @@ class FakeStore:
     def query_cases(self, **kwargs):
         self.query_calls.append(kwargs)
         statuses = kwargs.get("statuses") or ()
+        fnames = kwargs.get("fnames") or ()
         items = [
             case
             for case in sorted(self.cases.values(), key=lambda c: -c.id)
-            if not statuses or case.status in statuses
+            if (not statuses or case.status in statuses)
+            and (not fnames or case.item.fname.strip().casefold() in fnames)
         ]
         offset = kwargs.get("offset", 0)
         limit = kwargs.get("limit", 20)
@@ -230,11 +236,10 @@ class FakeJudge:
         return self.verdict
 
 
-SETTINGS = PatrolSettings(
-    forums=("test",),
-    auto_delete_enabled=False,
-    auto_delete_threshold=0.9,
-    report_threshold=0.6,
+SETTINGS = SettingsSnapshot(
+    global_=default_global_settings(),
+    forums=(ForumEntry(id=1, fname="test", account_id=1, created_at=1, updated_at=1),),
+    accounts=(Account(id=1, name="test", bduss="offline", stoken="offline", created_at=1, updated_at=1),),
 )
 
 
@@ -244,7 +249,7 @@ def services(**changes):
     base = WebServices(
         store=store,
         patrol=AsyncMock(),
-        gateway=FakeGateway(),
+        pool=GatewayPool(SETTINGS, factory=lambda *_: FakeGateway()),
         cases=FakeCaseService(store),
         judge=FakeJudge(),
         settings=SETTINGS,
@@ -278,11 +283,21 @@ def test_status_reports_state_and_newest_report():
     payload = body(call(routes.get_status))
     assert payload == {
         "has_account": True,
+        "configured": True,
         "patrol_enabled": True,
         "loop_running": True,
         "manual_running": True,
         "interval_seconds": 180,
-        "forums": ["test"],
+        "forums": [
+            {
+                "fname": "test",
+                "patrolled": True,
+                "problem": "",
+                "account_name": "test",
+                "auto_delete": {"enabled": False, "threshold": 0.9},
+                "report_threshold": 0.6,
+            }
+        ],
         "auto_delete": {"enabled": False, "threshold": 0.9},
         "report_threshold": 0.6,
         "pending": 1,
@@ -301,7 +316,7 @@ def test_status_reports_state_and_newest_report():
 
 
 def test_status_without_store_or_report():
-    routes, _ = routes_for(services(store=None, gateway=None))
+    routes, _ = routes_for(services(store=None, pool=None))
     assert call(routes.get_status).status_code == 503
     routes, _ = routes_for()
     assert body(call(routes.get_status))["last_report"] is None
@@ -507,7 +522,7 @@ def test_image_returns_data_url_and_caches():
     second = body(call(routes.get_case_image, case_id="1", index="0"))
     assert first == {"data_url": "data:image/png;base64,ZmFrZQ=="}
     assert second == first
-    bundle.gateway.fetch_images.assert_awaited_once_with(["a"], 1)
+    bundle.pool.any().fetch_images.assert_awaited_once_with(["a"], 1)
 
 
 def test_image_cache_is_bounded_and_evicts_oldest():
@@ -522,12 +537,12 @@ def test_image_cache_is_bounded_and_evicts_oldest():
         assert call(routes.get_case_image, case_id=str(case_id), index="0").status_code == 200
     assert len(routes._image_cache) == web.IMAGE_CACHE_SIZE
     # The oldest key was evicted and must be fetched again.
-    calls_before = bundle.gateway.fetch_images.await_count
+    calls_before = bundle.pool.any().fetch_images.await_count
     call(routes.get_case_image, case_id="1", index="0")
-    assert bundle.gateway.fetch_images.await_count == calls_before + 1
+    assert bundle.pool.any().fetch_images.await_count == calls_before + 1
     # The newest key is still cached.
     call(routes.get_case_image, case_id=str(web.IMAGE_CACHE_SIZE + 1), index="0")
-    assert bundle.gateway.fetch_images.await_count == calls_before + 1
+    assert bundle.pool.any().fetch_images.await_count == calls_before + 1
 
 
 @pytest.mark.parametrize("index", ["3", "9", "-1", "x", "1" * 19])
@@ -537,7 +552,7 @@ def test_image_index_validation(index):
     routes, _ = routes_for(bundle)
     response = call(routes.get_case_image, case_id="1", index=index)
     assert response.status_code == 404
-    bundle.gateway.fetch_images.assert_not_awaited()
+    bundle.pool.any().fetch_images.assert_not_awaited()
 
 
 @pytest.mark.parametrize("case_id", ["0", "abc", "9"])
@@ -547,11 +562,11 @@ def test_image_requires_an_existing_case(case_id):
     routes, _ = routes_for(bundle)
     response = call(routes.get_case_image, case_id=case_id, index="0")
     assert response.status_code in (400, 404)
-    bundle.gateway.fetch_images.assert_not_awaited()
+    bundle.pool.any().fetch_images.assert_not_awaited()
 
 
 def test_image_requires_credentials():
-    bundle = services(gateway=None)
+    bundle = services(pool=None)
     bundle.store.cases[1] = titled_case()
     routes, _ = routes_for(bundle)
     assert call(routes.get_case_image, case_id="1", index="0").status_code == 503
@@ -561,18 +576,18 @@ def test_image_failures_are_mapped_and_redacted():
     bundle = services()
     bundle.store.cases[1] = titled_case()
     routes, _ = routes_for(bundle)
-    bundle.gateway.fetch_images.side_effect = ImageFetchError("cdn said no")
+    bundle.pool.any().fetch_images.side_effect = ImageFetchError("cdn said no")
     response = call(routes.get_case_image, case_id="1", index="0")
     assert response.status_code == 502
     assert error(response) == "redacted: cdn said no"
 
-    bundle.gateway.fetch_images.side_effect = RuntimeError("boom")
+    bundle.pool.any().fetch_images.side_effect = RuntimeError("boom")
     response = call(routes.get_case_image, case_id="1", index="0")
     assert response.status_code == 500
     assert error(response) == web.INTERNAL_ERROR
 
-    bundle.gateway.fetch_images.side_effect = None
-    bundle.gateway.fetch_images.return_value = []
+    bundle.pool.any().fetch_images.side_effect = None
+    bundle.pool.any().fetch_images.return_value = []
     assert call(routes.get_case_image, case_id="1", index="0").status_code == 502
 
 
@@ -663,7 +678,7 @@ def test_actions_require_existing_case_and_credentials(action):
     response = call(getattr(routes, action), method="POST", case_id="5")
     assert response.status_code == 404
 
-    bundle = services(gateway=None, cases=None)
+    bundle = services(pool=None, cases=None)
     bundle.store.cases[1] = make_case(1)
     routes, _ = routes_for(bundle)
     assert call(getattr(routes, action), method="POST", case_id="1").status_code == 503
@@ -790,6 +805,8 @@ def test_stats_without_store_is_503():
 
 
 def test_bucket_index_is_clamped():
+    from astrbot_plugin_tieba_moderator.web import stats as web
+
     assert web._bucket_index(0.0) == 0
     assert web._bucket_index(1.0) == 9
     assert web._bucket_index(0.7) == 7
@@ -890,15 +907,15 @@ def test_check_uses_configured_rules_when_empty():
 
 def test_check_downloads_images_per_settings():
     bundle = services(
-        settings=dcs.replace(SETTINGS, review_images=True, max_images=2),
+        settings=dcs.replace(SETTINGS, global_=dcs.replace(SETTINGS.global_, review_images=True, max_images=2)),
         judge=FakeJudge(),
     )
-    bundle.gateway.get_thread_item_by_tid.return_value = make_item(
+    bundle.pool.any().get_thread_item_by_tid.return_value = make_item(
         image_urls=("a", "b", "c")
     )
     routes, _ = routes_for(bundle)
     payload = body(call(routes.post_check, method="POST", payload={"tid": 10}))
-    bundle.gateway.fetch_images.assert_awaited_once_with(("a", "b", "c"), 2)
+    bundle.pool.any().fetch_images.assert_awaited_once_with(("a", "b", "c"), 2)
     assert payload["images_reviewed"] == 1
     assert payload["images_total"] == 3
 
@@ -924,7 +941,7 @@ def test_check_rejects_bad_payloads(payload, match):
     response = call(routes.post_check, method="POST", payload=payload)
     assert response.status_code == 400
     assert match in error(response)
-    bundle.gateway.get_thread_item_by_tid.assert_not_awaited()
+    bundle.pool.any().get_thread_item_by_tid.assert_not_awaited()
 
 
 def test_check_accepts_maximum_rule_length():
@@ -939,7 +956,7 @@ def test_check_accepts_maximum_rule_length():
 def test_check_requires_store_and_credentials():
     routes, _ = routes_for(services(store=None))
     assert call(routes.post_check, method="POST", payload={"tid": 10}).status_code == 503
-    routes, _ = routes_for(services(gateway=None))
+    routes, _ = routes_for(services(pool=None))
     response = call(routes.post_check, method="POST", payload={"tid": 10})
     assert response.status_code == 503
 
@@ -1046,15 +1063,12 @@ class FakeContextForWeb:
         return None
 
 
-def make_plugin(**config):
+def make_plugin():
     context = FakeContextForWeb()
-    values = {
-        "forums": ["test"],
-        "patrol": {"enabled": False},
-        "notify": {"sessions": []},
-    }
-    values.update(config)
-    return entry.TiebaModeratorPlugin(context, FakeConfig(**values)), context
+    plugin = entry.TiebaModeratorPlugin(context)
+    snapshot = dcs.replace(SETTINGS, global_=dcs.replace(SETTINGS.global_, patrol_enabled=False))
+    plugin._settings_service = SimpleNamespace(snapshot=lambda: snapshot)
+    return plugin, context
 
 
 def test_registration_covers_every_route_under_the_plugin_prefix():
@@ -1073,6 +1087,16 @@ def test_registration_covers_every_route_under_the_plugin_prefix():
         f"/{entry.PLUGIN_NAME}/reports",
         f"/{entry.PLUGIN_NAME}/patrol/run",
         f"/{entry.PLUGIN_NAME}/check",
+        f"/{entry.PLUGIN_NAME}/settings",
+        f"/{entry.PLUGIN_NAME}/settings/global",
+        f"/{entry.PLUGIN_NAME}/forums",
+        f"/{entry.PLUGIN_NAME}/forums/<forum_id>",
+        f"/{entry.PLUGIN_NAME}/forums/<forum_id>/delete",
+        f"/{entry.PLUGIN_NAME}/accounts",
+        f"/{entry.PLUGIN_NAME}/accounts/<account_id>",
+        f"/{entry.PLUGIN_NAME}/accounts/<account_id>/delete",
+        f"/{entry.PLUGIN_NAME}/accounts/<account_id>/check",
+        f"/{entry.PLUGIN_NAME}/providers",
     }
     by_route = {route: methods for route, _, methods, _ in context.registered}
     assert by_route[f"/{entry.PLUGIN_NAME}/status"] == ["GET"]
@@ -1084,12 +1108,12 @@ def test_registration_covers_every_route_under_the_plugin_prefix():
 def test_services_reflect_live_dependencies():
     plugin, _ = make_plugin()
     assert plugin._web_services().store is None
-    assert plugin._web_services().gateway is None
+    assert plugin._web_services().pool is None
     store = FakeStore()
     plugin._store = store
-    plugin._gateway = FakeGateway()
+    plugin._pool = GatewayPool(SETTINGS, factory=lambda *_: FakeGateway())
     bundle = plugin._web_services()
-    assert bundle.store is store and bundle.gateway is plugin._gateway
+    assert bundle.store is store and bundle.pool is plugin._pool
     assert bundle.patrol_enabled is False
     assert bundle.manual_running is False
     assert bundle.loop_running is False
@@ -1129,12 +1153,30 @@ def test_finish_round_saves_the_report_and_survives_storage_errors(caplog):
     plugin._store = store
     report = PatrolReport(started_at=1, finished_at=2, errors=("post:1 failed",))
     plugin._finish_round(report)
+    # The stored report is a scrubbed copy; with no credentials it is equal.
     assert store.save_calls == [report]
-    assert plugin._last_report is report
+    assert plugin._last_report == report
 
     store.fail_save = True
     plugin._finish_round(report)
-    assert plugin._last_report is report
+    assert plugin._last_report == report
+
+
+def test_finish_round_scrubs_credentials_out_of_report_errors():
+    plugin, _ = make_plugin()
+    store = FakeStore()
+    plugin._store = store
+    plugin._secrets.add("secret-bduss-value")
+    report = PatrolReport(
+        started_at=1,
+        finished_at=2,
+        errors=("read failed for secret-bduss-value",),
+    )
+    plugin._finish_round(report)
+    assert store.save_calls[0].errors == ("read failed for ***",)
+    assert plugin._last_report.errors == ("read failed for ***",)
+    # The caller's object is untouched.
+    assert report.errors == ("read failed for secret-bduss-value",)
 
 
 def test_manual_round_failure_returns_none_without_saving():
@@ -1179,6 +1221,7 @@ def test_tb_run_shares_the_manual_flag_and_reports_the_outcome():
     plugin, _ = make_plugin()
     store = FakeStore()
     plugin._store = store
+    plugin._pool = GatewayPool(SETTINGS, factory=lambda *_: FakeGateway())
     report = PatrolReport(started_at=1, finished_at=2, reported=1)
 
     async def scenario():
@@ -1219,7 +1262,7 @@ def test_total_chars_limit_evicts_oldest_entries(monkeypatch):
     monkeypatch.setattr(web, "IMAGE_CACHE_MAX_ENTRY_CHARS", 4_000)
     routes, bundle = cached_case(images=tuple(f"u{index}" for index in range(9)))
     payload = "data:image/jpeg;base64," + "A" * 3_900
-    bundle.gateway.fetch_images.return_value = [payload]
+    bundle.pool.any().fetch_images.return_value = [payload]
     for index in range(9):
         assert call(routes.get_case_image, case_id="1", index=str(index)).status_code == 200
     # Two entries fit under 10_000 chars; a third would exceed it.
@@ -1233,7 +1276,7 @@ def test_running_char_count_matches_the_entries_after_evictions(monkeypatch):
     monkeypatch.setattr(web, "IMAGE_CACHE_MAX_CHARS", 10_000)
     monkeypatch.setattr(web, "IMAGE_CACHE_MAX_ENTRY_CHARS", 4_000)
     routes, bundle = cached_case(images=tuple(f"u{index}" for index in range(6)))
-    bundle.gateway.fetch_images.return_value = ["x" * 4_000]
+    bundle.pool.any().fetch_images.return_value = ["x" * 4_000]
     for index in range(6):
         call(routes.get_case_image, case_id="1", index=str(index))
     assert routes._image_cache_chars == cache_total(routes) == 8_000
@@ -1250,7 +1293,7 @@ def test_oversized_single_image_is_served_but_not_cached(monkeypatch):
     monkeypatch.setattr(web, "IMAGE_CACHE_MAX_CHARS", 1_000)
     monkeypatch.setattr(web, "IMAGE_CACHE_MAX_ENTRY_CHARS", 125)
     routes, bundle = cached_case()
-    bundle.gateway.fetch_images.return_value = ["y" * 126]
+    bundle.pool.any().fetch_images.return_value = ["y" * 126]
     response = call(routes.get_case_image, case_id="1", index="0")
     assert response.status_code == 200
     assert body(response) == {"data_url": "y" * 126}
@@ -1258,14 +1301,14 @@ def test_oversized_single_image_is_served_but_not_cached(monkeypatch):
     assert routes._image_cache_chars == 0
     # It is fetched again next time because nothing was cached.
     call(routes.get_case_image, case_id="1", index="0")
-    assert bundle.gateway.fetch_images.await_count == 2
+    assert bundle.pool.any().fetch_images.await_count == 2
 
 
 def test_entry_size_boundary_is_inclusive(monkeypatch):
     monkeypatch.setattr(web, "IMAGE_CACHE_MAX_CHARS", 1_000)
     monkeypatch.setattr(web, "IMAGE_CACHE_MAX_ENTRY_CHARS", 125)
     routes, bundle = cached_case()
-    bundle.gateway.fetch_images.return_value = ["z" * 125]
+    bundle.pool.any().fetch_images.return_value = ["z" * 125]
     call(routes.get_case_image, case_id="1", index="0")
     assert routes._image_cache == {"1:0": "z" * 125}
     assert routes._image_cache_chars == 125
@@ -1274,7 +1317,7 @@ def test_entry_size_boundary_is_inclusive(monkeypatch):
 def test_entry_count_still_caps_the_cache(monkeypatch):
     monkeypatch.setattr(web, "IMAGE_CACHE_SIZE", 2)
     routes, bundle = cached_case(images=tuple(f"u{index}" for index in range(4)))
-    bundle.gateway.fetch_images.return_value = ["q" * 10]
+    bundle.pool.any().fetch_images.return_value = ["q" * 10]
     for index in range(4):
         call(routes.get_case_image, case_id="1", index=str(index))
     assert list(routes._image_cache) == ["1:2", "1:3"]
@@ -1284,10 +1327,10 @@ def test_entry_count_still_caps_the_cache(monkeypatch):
 def test_cache_hit_does_not_refetch_and_stays_within_budget(monkeypatch):
     monkeypatch.setattr(web, "IMAGE_CACHE_MAX_CHARS", 100)
     routes, bundle = cached_case()
-    bundle.gateway.fetch_images.return_value = ["w" * 60]
+    bundle.pool.any().fetch_images.return_value = ["w" * 60]
     call(routes.get_case_image, case_id="1", index="0")
     call(routes.get_case_image, case_id="1", index="0")
-    assert bundle.gateway.fetch_images.await_count == 1
+    assert bundle.pool.any().fetch_images.await_count == 1
     assert routes._image_cache_chars == cache_total(routes) == 60
 
 
@@ -1298,3 +1341,171 @@ def test_replacing_an_entry_adjusts_the_running_count():
     routes._remember_image("1:0", "b" * 40)
     assert routes._image_cache == {"1:0": "b" * 40}
     assert routes._image_cache_chars == 40 == cache_total(routes)
+
+
+# --- v0.3 additions ---------------------------------------------------------
+
+
+def case_with_forum(fname, case_id=1, *, created_at=2_000_000_000, status=CaseStatus.PENDING):
+    """A case whose item records a specific forum."""
+    return dcs.replace(
+        make_case(case_id, status=status),
+        item=make_item(fname=fname),
+        created_at=created_at,
+    )
+
+
+def test_stats_fname_filters_to_one_forum():
+    bundle = services()
+    bundle.store.cases[1] = case_with_forum("Dragon")
+    bundle.store.cases[2] = case_with_forum("Other", case_id=2)
+    routes, _ = routes_for(bundle, clock=lambda: 2_000_000_000)
+    payload = body(call(routes.get_stats, query=[("fname", " dragon ")]))
+    assert payload["total"] == 1
+    assert payload["by_category"][0]["total"] == 1
+
+
+def test_stats_fname_pages_through_more_than_one_page(monkeypatch):
+    from astrbot_plugin_tieba_moderator.web import stats as web
+
+    monkeypatch.setattr(web, "STATS_PAGE_LIMIT", 2)
+    bundle = services()
+    for index in range(1, 6):
+        bundle.store.cases[index] = case_with_forum("Dragon", case_id=index)
+    routes, _ = routes_for(bundle)
+    payload = body(call(routes.get_stats, query=[("fname", "Dragon")]))
+    assert payload["total"] == 5
+
+
+def test_stats_fname_stops_at_the_case_cap(monkeypatch):
+    from astrbot_plugin_tieba_moderator.web import stats as web
+
+    monkeypatch.setattr(web, "STATS_PAGE_LIMIT", 2)
+    monkeypatch.setattr(web, "STATS_MAX_CASES", 3)
+    bundle = services()
+    for index in range(1, 6):
+        bundle.store.cases[index] = case_with_forum("Dragon", case_id=index)
+    routes, _ = routes_for(bundle)
+    payload = body(call(routes.get_stats, query=[("fname", "Dragon")]))
+    assert payload["total"] == 4
+
+
+def test_stats_fname_excludes_cases_older_than_the_window():
+    bundle = services()
+    bundle.store.cases[1] = case_with_forum("Dragon", created_at=1_000_000_000)
+    bundle.store.cases[2] = case_with_forum("Dragon", case_id=2)
+    routes, _ = routes_for(bundle, clock=lambda: 2_000_000_000)
+    payload = body(call(routes.get_stats, query=[("fname", "Dragon"), ("days", "30")]))
+    assert payload["total"] == 1
+
+
+def test_stats_fname_handles_a_case_deleted_between_pages(monkeypatch):
+    """The second page can be empty even though the first was full."""
+    from astrbot_plugin_tieba_moderator.web import stats as web
+
+    monkeypatch.setattr(web, "STATS_PAGE_LIMIT", 1)
+
+    class ShrinkingStore(FakeStore):
+        def query_cases(self, **kwargs):
+            if kwargs.get("offset", 0) == 0:
+                return 9, [case_with_forum("Dragon")]
+            return 0, []
+
+    bundle = services()
+    bundle = dcs.replace(bundle, store=ShrinkingStore())
+    routes, _ = routes_for(bundle)
+    payload = body(call(routes.get_stats, query=[("fname", "Dragon")]))
+    assert payload["total"] == 1
+
+
+def test_stats_rejects_an_overlong_fname():
+    routes, _ = routes_for()
+    response = call(routes.get_stats, query=[("fname", "x" * 65)])
+    assert response.status_code == 400
+    assert "fname" in error(response)
+
+
+def test_status_marks_a_forum_without_an_account():
+    bundle = services()
+    settings = bundle.settings
+    entry = dcs.replace(settings.forums[0], account_id=None)
+    bundle = dcs.replace(
+        bundle, settings=dcs.replace(settings, forums=(entry,))
+    )
+    routes, _ = routes_for(bundle)
+    payload = body(call(routes.get_status))
+    assert payload["forums"][0]["problem"] == "未选择账号"
+    assert payload["forums"][0]["patrolled"] is False
+    assert payload["configured"] is False
+    assert payload["has_account"] is True
+
+
+def test_check_reports_fname_and_resolved_thresholds():
+    bundle = services()
+    routes, _ = routes_for(bundle)
+    payload = body(call(routes.post_check, method="POST", payload={"tid": 10}))
+    # The forum comes from the fetched thread, which the fake gateway sets.
+    assert payload["fname"] == "test"
+    assert payload["thresholds"] == {
+        "auto_delete": {"enabled": False, "threshold": 0.9},
+        "report_threshold": 0.6,
+    }
+
+
+def test_image_returns_503_when_the_pool_has_no_gateway():
+    bundle = services()
+    bundle.store.cases[1] = titled_case()
+    bundle = dcs.replace(bundle, pool=_EmptyPool())
+    routes, _ = routes_for(bundle)
+    assert call(routes.get_case_image, case_id="1", index="0").status_code == 503
+
+
+def test_check_returns_503_when_the_pool_has_no_gateway():
+    bundle = services()
+    bundle = dcs.replace(bundle, pool=_EmptyPool())
+    routes, _ = routes_for(bundle)
+    assert call(routes.post_check, method="POST", payload={"tid": 10}).status_code == 503
+
+
+class _EmptyPool:
+    """Pool whose lease always yields no gateway."""
+
+    def any(self):
+        return None
+
+    def get(self, account_id):
+        return None
+
+    @asynccontextmanager
+    async def lease(self, account_id=None):
+        yield None
+
+
+def test_image_race_with_account_deletion_is_503(monkeypatch):
+    """A pool that loses its gateway between the pre-check and the lease."""
+    bundle = services()
+    bundle.store.cases[1] = titled_case()
+    bundle = dcs.replace(bundle, pool=_VanishingPool())
+    routes, _ = routes_for(bundle)
+    assert call(routes.get_case_image, case_id="1", index="0").status_code == 503
+
+
+def test_check_race_with_account_deletion_is_503():
+    bundle = services()
+    bundle = dcs.replace(bundle, pool=_VanishingPool())
+    routes, _ = routes_for(bundle)
+    assert call(routes.post_check, method="POST", payload={"tid": 10}).status_code == 503
+
+
+class _VanishingPool:
+    """Pool that still reports a gateway but leases none."""
+
+    def any(self):
+        return object()
+
+    def get(self, account_id):
+        return object()
+
+    @asynccontextmanager
+    async def lease(self, account_id=None):
+        yield None

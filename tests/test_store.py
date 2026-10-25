@@ -19,6 +19,13 @@ from astrbot_plugin_tieba_moderator.core.models import (
     PatrolReport,
     Verdict,
 )
+from astrbot_plugin_tieba_moderator.core.settings import (
+    AccountDraft,
+    ForumDraft,
+    ForumOverrides,
+    SettingsSnapshot,
+    default_global_settings,
+)
 from astrbot_plugin_tieba_moderator.core.store import Store
 
 
@@ -739,3 +746,140 @@ def test_opening_legacy_database_adds_reports_and_preserves_existing_case(
         assert reopened.list_reports(20) == [report]
     finally:
         reopened.close()
+
+
+def test_settings_default_read_does_not_create_global_row(store):
+    assert store.load_settings() == SettingsSnapshot(global_=default_global_settings())
+    assert store._connection.execute("SELECT COUNT(*) FROM settings_global").fetchone()[0] == 0
+
+
+def test_settings_crud_roundtrip_revision_timestamps_and_reopen(tmp_path):
+    path = tmp_path / "settings.db"
+    store = Store(path, clock=count(100).__next__)
+    try:
+        global_ = replace(default_global_settings(), sessions=("session",),
+                          operators=frozenset({"operator"}))
+        assert store.save_global(global_) == 1
+        account = store.insert_account(AccountDraft(name="O'Reilly", bduss="fake-bduss", stoken="fake-stoken"))
+        assert account.created_at == account.updated_at == 100
+        forum = store.insert_forum(ForumDraft(fname=" Straße ", account_id=account.id,
+            sessions=("local",), operators=frozenset({"mod"}), whitelist=frozenset({"safe"}),
+            overrides=ForumOverrides(provider_id="model", rules="quoted ' rules")))
+        assert forum.fname == "Straße"
+        assert forum.created_at == forum.updated_at == 101
+        before = store.load_settings()
+        assert before == SettingsSnapshot(global_=global_, accounts=(account,), forums=(forum,), revision=3)
+        changed_account = store.update_account(account.id, AccountDraft(name="renamed", bduss="new-fake"))
+        assert changed_account == replace(account, name="renamed", bduss="new-fake", updated_at=102)
+        changed_forum = store.update_forum(forum.id, ForumDraft(fname="new", enabled=False))
+        assert changed_forum.created_at == 101 and changed_forum.updated_at == 103
+        assert not changed_forum.enabled and changed_forum.account_id is None
+        assert changed_forum.sessions == () and changed_forum.overrides == ForumOverrides()
+        assert store.save_global(global_) == 6
+        expected = store.load_settings()
+    finally:
+        store.close()
+    reopened = Store(path)
+    try:
+        assert reopened.load_settings() == expected
+        assert reopened.delete_forum(forum.id)
+        assert reopened.load_settings().revision == 7
+        assert reopened.delete_account(account.id)
+        assert reopened.load_settings() == SettingsSnapshot(global_=global_, revision=8)
+    finally:
+        reopened.close()
+
+
+def test_settings_missing_ids_do_not_advance_revision(store):
+    assert store.update_account(1, AccountDraft(name="missing")) is None
+    assert store.update_forum(1, ForumDraft(fname="missing")) is None
+    assert not store.delete_account(1)
+    assert not store.delete_forum(1)
+    assert store.load_settings().revision == 0
+
+
+def test_account_empty_update_credentials_preserve_saved_values(store):
+    account = store.insert_account(AccountDraft(name="a", bduss="fake-b", stoken="fake-s"))
+    for bduss, stoken in ((None, None), ("", "")):
+        updated = store.update_account(account.id, AccountDraft(name="a", bduss=bduss, stoken=stoken))
+        assert (updated.bduss, updated.stoken) == ("fake-b", "fake-s")
+    updated = store.update_account(account.id, AccountDraft(name="a", stoken="replacement"))
+    assert updated.stoken == "replacement" and updated.bduss == "fake-b"
+
+
+def test_forum_unique_casefold_key_rolls_back_conflicting_insert_and_update(store):
+    first = store.insert_forum(ForumDraft(fname="Straße"))
+    second = store.insert_forum(ForumDraft(fname="second"))
+    before = store.load_settings()
+    with pytest.raises(sqlite3.IntegrityError):
+        store.insert_forum(ForumDraft(fname=" STRASSE "))
+    with pytest.raises(sqlite3.IntegrityError):
+        store.update_forum(second.id, ForumDraft(fname="strasse"))
+    assert store.load_settings() == before
+    assert first.fname == "Straße"
+
+
+@pytest.mark.parametrize("operation", ["global", "insert_account", "update_account", "delete_account",
+                                        "insert_forum", "update_forum", "delete_forum"])
+def test_revision_failure_rolls_back_entire_settings_mutation(store, operation):
+    account = store.insert_account(AccountDraft(name="a", bduss="fake-b", stoken="fake-s"))
+    forum = store.insert_forum(ForumDraft(fname="f"))
+    before = store.load_settings()
+    store._connection.execute("""
+        CREATE TRIGGER reject_revision BEFORE UPDATE ON settings_global
+        BEGIN SELECT RAISE(ABORT, 'revision failure'); END
+    """)
+    operations = {
+        "global": lambda: store.save_global(replace(before.global_, interval_seconds=700)),
+        "insert_account": lambda: store.insert_account(AccountDraft(name="new", bduss="fake-b", stoken="fake-s")),
+        "update_account": lambda: store.update_account(account.id, AccountDraft(name="changed")),
+        "delete_account": lambda: store.delete_account(account.id),
+        "insert_forum": lambda: store.insert_forum(ForumDraft(fname="new")),
+        "update_forum": lambda: store.update_forum(forum.id, ForumDraft(fname="changed")),
+        "delete_forum": lambda: store.delete_forum(forum.id),
+    }
+    with pytest.raises(sqlite3.IntegrityError, match="revision failure"):
+        operations[operation]()
+    assert store.load_settings() == before
+
+
+def test_settings_mutations_preserve_existing_moderation_data(store, item, verdict, report):
+    case = store.create_case(item, verdict, CaseStatus.PENDING, 1)
+    store.set_thread_mark(10, 20)
+    store.set_post_mark(30, 40)
+    store.mark_seen("seen")
+    store.record_failure("failed")
+    store.save_report(report)
+    store.save_global(default_global_settings())
+    account = store.insert_account(AccountDraft(name="a", bduss="fake-b", stoken="fake-s"))
+    forum = store.insert_forum(ForumDraft(fname="f", account_id=account.id))
+    store.delete_forum(forum.id)
+    store.delete_account(account.id)
+    assert store.get_case(case.id) == case and store.list_reports(1) == [report]
+    assert store.get_thread_mark(10) == 20 and store.get_post_mark(30) == 40
+    assert store.is_seen("seen") and store.record_failure("failed") == 2
+
+
+def test_concurrent_store_settings_writes_increment_revision_without_lost_updates(tmp_path):
+    path = tmp_path / "concurrent-settings.db"
+    Store(path).close()
+    barrier = Barrier(2, timeout=5)
+
+    def insert(worker):
+        database = Store(path)
+        try:
+            barrier.wait()
+            for index in range(10):
+                database.insert_forum(ForumDraft(fname=f"{worker}-{index}"))
+        finally:
+            database.close()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        list(executor.map(insert, range(2)))
+    database = Store(path)
+    try:
+        snapshot = database.load_settings()
+        assert snapshot.revision == 20 and len(snapshot.forums) == 20
+        assert len({forum.id for forum in snapshot.forums}) == 20
+    finally:
+        database.close()

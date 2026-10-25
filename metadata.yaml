@@ -2,7 +2,7 @@ name: astrbot_plugin_tieba_moderator
 display_name: 贴吧 AI 巡查
 desc: 定时巡查百度贴吧的主题帖、楼层和楼中楼，用多模态 LLM 按吧规判断文字与图片是否违规；高置信度可自动删帖，其余推送到吧务群由吧务确认删除、封禁或忽略。
 short_desc: 用 LLM 按吧规审核贴吧内容（含图片）
-version: v0.2.0
+version: v0.3.0
 author: Dracowyn
 repo: https://github.com/Dracowyn/astrbot_plugin_tieba_moderator
 astrbot_version: ">=4.29,<5"

@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING
 
 from ..core.models import ALLOWED_BAN_DAYS, Case, CaseStatus, TiebaActionError
 
 if TYPE_CHECKING:
     from ..core.store import Store
+    from .gateway_pool import GatewayPool
+    from .settings_service import SettingsService
     from .tieba_gateway import TiebaGateway
 
 
@@ -30,18 +33,21 @@ class CaseService:
     def __init__(
         self,
         *,
-        gateway: TiebaGateway,
+        pool: GatewayPool,
+        settings: SettingsService,
         store: Store,
         clock: Callable[[], float] = time.time,
     ) -> None:
         """Set the service dependencies.
 
         Args:
-            gateway: Tieba action gateway.
+            pool: Account gateways with operation-scoped leases.
+            settings: Current per-forum account selection.
             store: Case persistence with atomic conditional transitions.
             clock: Unix-time source sampled when an update is attempted.
         """
-        self._gateway = gateway
+        self._pool = pool
+        self._settings = settings
         self._store = store
         self._clock = clock
         self._lock = asyncio.Lock()
@@ -62,8 +68,9 @@ class CaseService:
         """
         async with self._lock:
             case = self._require_case(case_id, (CaseStatus.PENDING,))
-            await self._gateway.delete(case.item)
-            return self._transition(case, CaseStatus.DELETED, operator)
+            async with self._gateway_for(case) as gateway:
+                await gateway.delete(case.item)
+                return self._transition(case, CaseStatus.DELETED, operator)
 
     async def ban(self, case_id: int, days: int, operator: str) -> Case:
         """Delete pending content if needed, then ban its author.
@@ -89,19 +96,23 @@ class CaseService:
                 case_id,
                 (CaseStatus.PENDING, CaseStatus.AUTO_DELETED, CaseStatus.DELETED),
             )
-            deleted_now = case.status is CaseStatus.PENDING
-            if deleted_now:
-                await self._gateway.delete(case.item)
-            reason = f"{case.verdict.category}：{case.verdict.reason}"[:50]
-            try:
-                await self._gateway.block(case.item, days, reason)
-            except TiebaActionError as error:
+            async with self._gateway_for(case) as gateway:
+                deleted_now = case.status is CaseStatus.PENDING
                 if deleted_now:
-                    self._transition(
-                        case, CaseStatus.DELETED, operator, note=f"封禁失败：{error}"
-                    )
-                raise
-            return self._transition(case, CaseStatus.BANNED, operator)
+                    await gateway.delete(case.item)
+                reason = f"{case.verdict.category}：{case.verdict.reason}"[:50]
+                try:
+                    await gateway.block(case.item, days, reason)
+                except TiebaActionError as error:
+                    if deleted_now:
+                        self._transition(
+                            case,
+                            CaseStatus.DELETED,
+                            operator,
+                            note=f"封禁失败：{error}",
+                        )
+                    raise
+                return self._transition(case, CaseStatus.BANNED, operator)
 
     async def ignore(self, case_id: int, operator: str) -> Case:
         """Dismiss a pending report without performing a remote action.
@@ -139,8 +150,21 @@ class CaseService:
                 case_id,
                 (CaseStatus.AUTO_DELETED, CaseStatus.DELETED, CaseStatus.BANNED),
             )
-            await self._gateway.restore(case.item)
-            return self._transition(case, CaseStatus.RESTORED, operator)
+            async with self._gateway_for(case) as gateway:
+                await gateway.restore(case.item)
+                return self._transition(case, CaseStatus.RESTORED, operator)
+
+    @asynccontextmanager
+    async def _gateway_for(self, case: Case) -> AsyncIterator[TiebaGateway]:
+        """Resolve once under the action lock and lease through the local commit."""
+        forum = self._settings.resolve(case.item.fname)
+        missing = f"{case.item.fname} 吧没有可用的吧务账号"
+        if not forum.configured or forum.account_id is None:
+            raise CaseError(missing)
+        async with self._pool.lease(forum.account_id) as gateway:
+            if gateway is None:
+                raise CaseError(missing)
+            yield gateway
 
     def _require_case(self, case_id: int, allowed: tuple[CaseStatus, ...]) -> Case:
         case = self._store.get_case(case_id)

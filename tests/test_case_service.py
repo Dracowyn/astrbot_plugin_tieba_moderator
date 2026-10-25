@@ -16,8 +16,18 @@ from astrbot_plugin_tieba_moderator.core.models import (
     TiebaActionError,
     Verdict,
 )
+from astrbot_plugin_tieba_moderator.core.settings import (
+    Account,
+    ForumEntry,
+    ForumOptions,
+    GlobalSettings,
+    SettingsSnapshot,
+    resolve,
+)
 from astrbot_plugin_tieba_moderator.core.store import Store
 from astrbot_plugin_tieba_moderator.services.case_service import CaseError, CaseService
+from astrbot_plugin_tieba_moderator.services.gateway_pool import GatewayPool
+from astrbot_plugin_tieba_moderator.services.settings_service import SettingsService
 
 TRANSITIONS = [
     ("delete", CaseStatus.PENDING, CaseStatus.DELETED, ["delete"]),
@@ -47,10 +57,27 @@ def setup_case(tmp_path):
         violation=True, category="广告", confidence=0.9, reason="重复推广", ban_days=1
     )
     gateway = SimpleNamespace(
-        delete=AsyncMock(), block=AsyncMock(), restore=AsyncMock()
+        delete=AsyncMock(), block=AsyncMock(), restore=AsyncMock(), close=AsyncMock()
     )
     clock = Mock(side_effect=(value + 0.75 for value in count(1000)))
-    service = CaseService(gateway=gateway, store=store, clock=clock)
+    snapshot = SettingsSnapshot(
+        global_=GlobalSettings(defaults=ForumOptions(rules="rules")),
+        accounts=(
+            Account(
+                id=1, name="moderator", bduss="fake-bduss", stoken="fake-stoken",
+                created_at=1, updated_at=1,
+            ),
+        ),
+        forums=(
+            ForumEntry(
+                id=1, fname=item.fname, account_id=1, created_at=1, updated_at=1
+            ),
+        ),
+    )
+    settings = SettingsService(store, snapshot=snapshot)
+    factory = Mock(return_value=gateway)
+    pool = GatewayPool(snapshot, factory=factory)
+    service = CaseService(pool=pool, settings=settings, store=store, clock=clock)
 
     def create(status=CaseStatus.PENDING):
         return store.create_case(item, verdict, status, 100)
@@ -58,10 +85,15 @@ def setup_case(tmp_path):
     yield SimpleNamespace(
         store=store,
         gateway=gateway,
+        pool=pool,
+        settings=settings,
+        snapshot=snapshot,
+        factory=factory,
         clock=clock,
         service=service,
         create=create,
     )
+    asyncio.run(pool.close())
     store.close()
 
 
@@ -378,7 +410,9 @@ def test_all_actions_wait_before_reading_or_validating(
 def test_cross_instance_concurrent_delete_preserves_cas_winner(setup_case):
     setup = setup_case
     case = setup.create()
-    other = CaseService(gateway=setup.gateway, store=setup.store, clock=setup.clock)
+    other = CaseService(
+        pool=setup.pool, settings=setup.settings, store=setup.store, clock=setup.clock
+    )
 
     async def yield_delete(item):
         await asyncio.sleep(0)
@@ -400,3 +434,213 @@ def test_cross_instance_concurrent_delete_preserves_cas_winner(setup_case):
     assert "处理" in str(loser)
     assert setup.gateway.delete.await_count == 2
     assert setup.store.get_case(case.id) == winner
+
+
+@pytest.mark.parametrize("operation,status", [
+    ("delete", CaseStatus.PENDING),
+    ("ban", CaseStatus.PENDING),
+    ("restore", CaseStatus.DELETED),
+])
+@pytest.mark.parametrize("missing", ["forum", "account", "gateway"])
+def test_missing_account_has_exact_error_without_side_effects(
+    setup_case, monkeypatch, operation, status, missing
+):
+    setup = setup_case
+    case = setup.create(status)
+    current = setup.snapshot
+    if missing == "forum":
+        current = replace(current, forums=())
+    else:
+        forum = replace(current.forums[0], account_id=None if missing == "account" else 99)
+        current = replace(current, forums=(forum,))
+    monkeypatch.setattr(setup.settings, "resolve", lambda fname: resolve(current, fname))
+    events = record_order(setup, monkeypatch)
+    with pytest.raises(CaseError) as caught:
+        invoke(setup.service, operation, case.id)
+    assert str(caught.value) == f"{case.item.fname} 吧没有可用的吧务账号"
+    assert events == []
+    assert setup.store.get_case(case.id) == case
+    setup.clock.assert_not_called()
+
+
+def test_ignore_needs_neither_configured_forum_nor_gateway(setup_case, monkeypatch):
+    setup = setup_case
+    case = setup.create()
+    monkeypatch.setattr(setup.settings, "resolve", Mock(side_effect=AssertionError))
+    asyncio.run(setup.pool.close())
+    result = invoke(setup.service, "ignore", case.id)
+    assert result.status is CaseStatus.IGNORED
+    setup.gateway.delete.assert_not_awaited()
+    setup.gateway.block.assert_not_awaited()
+    setup.gateway.restore.assert_not_awaited()
+
+
+def test_disabled_forum_can_still_be_moderated(setup_case, monkeypatch):
+    setup = setup_case
+    case = setup.create()
+    current = replace(
+        setup.snapshot, forums=(replace(setup.snapshot.forums[0], enabled=False),)
+    )
+    monkeypatch.setattr(setup.settings, "resolve", lambda fname: resolve(current, fname))
+    assert invoke(setup.service, "delete", case.id).status is CaseStatus.DELETED
+    setup.gateway.delete.assert_awaited_once_with(case.item)
+
+
+def test_each_case_selects_its_own_account(setup_case, monkeypatch):
+    setup = setup_case
+    first = setup.create()
+    second = setup.store.create_case(
+        replace(first.item, fname="Other", tid=20, pid=30),
+        first.verdict, CaseStatus.PENDING, 100,
+    )
+    other = SimpleNamespace(delete=AsyncMock(), close=AsyncMock())
+    setup.factory.return_value = other
+    current = replace(
+        setup.snapshot,
+        accounts=(*setup.snapshot.accounts, replace(setup.snapshot.accounts[0], id=2)),
+        forums=(*setup.snapshot.forums, replace(
+            setup.snapshot.forums[0], id=2, fname="other", account_id=2
+        )),
+    )
+    monkeypatch.setattr(setup.settings, "resolve", lambda fname: resolve(current, fname))
+
+    async def scenario():
+        await setup.pool.update(current)
+        await setup.service.delete(first.id, "first")
+        await setup.service.delete(second.id, "second")
+
+    asyncio.run(scenario())
+    setup.gateway.delete.assert_awaited_once_with(first.item)
+    other.delete.assert_awaited_once_with(second.item)
+
+
+@pytest.mark.parametrize("operation,status,remote", [
+    ("delete", CaseStatus.PENDING, "delete"),
+    ("ban", CaseStatus.PENDING, "delete"),
+    ("restore", CaseStatus.DELETED, "restore"),
+])
+@pytest.mark.parametrize("change", ["replace", "delete"])
+def test_operation_keeps_gateway_through_remote_actions_and_commit(
+    setup_case, monkeypatch, operation, status, remote, change
+):
+    setup = setup_case
+    case = setup.create(status)
+    old = setup.gateway
+    new = SimpleNamespace(
+        delete=AsyncMock(), block=AsyncMock(), restore=AsyncMock(), close=AsyncMock()
+    )
+    setup.factory.return_value = new
+    changed = replace(
+        setup.snapshot,
+        accounts=(() if change == "delete" else (
+            replace(setup.snapshot.accounts[0], bduss="replacement"),
+        )),
+    )
+    transition = setup.store.transition
+
+    def commit(*args, **kwargs):
+        old.close.assert_not_awaited()
+        return transition(*args, **kwargs)
+
+    monkeypatch.setattr(setup.store, "transition", commit)
+
+    async def change_settings(*args):
+        await setup.pool.update(changed)
+        old.close.assert_not_awaited()
+
+    getattr(old, remote).side_effect = change_settings
+    result = invoke(setup.service, operation, case.id)
+    assert result == setup.store.get_case(case.id)
+    old.close.assert_awaited_once_with()
+    new.delete.assert_not_awaited()
+    new.block.assert_not_awaited()
+    new.restore.assert_not_awaited()
+    if operation == "ban":
+        old.block.assert_awaited_once_with(case.item, 3, "广告：重复推广")
+
+
+def test_partial_ban_failure_commits_before_retired_gateway_closes(setup_case, monkeypatch):
+    setup = setup_case
+    case = setup.create()
+    transition = setup.store.transition
+
+    def commit(*args, **kwargs):
+        setup.gateway.close.assert_not_awaited()
+        return transition(*args, **kwargs)
+
+    monkeypatch.setattr(setup.store, "transition", commit)
+
+    async def deleted(*args):
+        await setup.pool.update(replace(setup.snapshot, accounts=()))
+
+    setup.gateway.delete.side_effect = deleted
+    setup.gateway.block.side_effect = TiebaActionError("blocked")
+    with pytest.raises(TiebaActionError, match="blocked"):
+        invoke(setup.service, "ban", case.id)
+    assert setup.store.get_case(case.id).status is CaseStatus.DELETED
+    setup.gateway.close.assert_awaited_once_with()
+
+
+def test_waiting_action_resolves_account_only_after_acquiring_lock(setup_case, monkeypatch):
+    setup = setup_case
+    case = setup.create()
+    current = [setup.snapshot]
+    resolution = Mock(side_effect=lambda fname: resolve(current[0], fname))
+    monkeypatch.setattr(setup.settings, "resolve", resolution)
+    new = SimpleNamespace(delete=AsyncMock(), restore=AsyncMock(), close=AsyncMock())
+    setup.factory.return_value = new
+
+    async def scenario():
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_delete(*args):
+            entered.set()
+            await release.wait()
+
+        setup.gateway.delete.side_effect = slow_delete
+        first = asyncio.create_task(setup.service.delete(case.id, "first"))
+        await entered.wait()
+        second = asyncio.create_task(setup.service.restore(case.id, "second"))
+        await asyncio.sleep(0)
+        resolution.assert_called_once_with(case.item.fname)
+        current[0] = replace(setup.snapshot, accounts=(
+            replace(setup.snapshot.accounts[0], bduss="replacement"),
+        ))
+        await setup.pool.update(current[0])
+        release.set()
+        await asyncio.gather(first, second)
+
+    asyncio.run(scenario())
+    setup.gateway.delete.assert_awaited_once_with(case.item)
+    setup.gateway.restore.assert_not_awaited()
+    new.restore.assert_awaited_once_with(case.item)
+    setup.gateway.close.assert_awaited_once_with()
+
+
+def test_cancelled_action_releases_lease_and_lock_without_commit(setup_case, monkeypatch):
+    setup = setup_case
+    case = setup.create()
+    transition = Mock(wraps=setup.store.transition)
+    monkeypatch.setattr(setup.store, "transition", transition)
+
+    async def scenario():
+        entered = asyncio.Event()
+
+        async def slow_delete(*args):
+            entered.set()
+            await asyncio.Event().wait()
+
+        setup.gateway.delete.side_effect = slow_delete
+        action = asyncio.create_task(setup.service.delete(case.id, "first"))
+        await entered.wait()
+        await setup.pool.update(replace(setup.snapshot, accounts=()))
+        action.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await action
+        transition.assert_not_called()
+        assert setup.store.get_case(case.id) == case
+        setup.gateway.close.assert_awaited_once_with()
+        assert (await setup.service.ignore(case.id, "second")).status is CaseStatus.IGNORED
+
+    asyncio.run(scenario())

@@ -8,7 +8,9 @@ from unittest.mock import AsyncMock, Mock, call
 
 import aiohttp
 import pytest
+from aiotieba.api._classdef import UserInfo
 from aiotieba.api._classdef.contents import FragEmoji, FragLink, FragText, FragTiebaPlus
+from aiotieba.api.get_bawu_info._classdef import BawuInfo, UserInfo_bawu
 from aiotieba.api.get_comments import Comment, Comments
 from aiotieba.api.get_comments._classdef import Contents_c, FragAt_c, Page_c
 from aiotieba.api.get_posts import Post, Posts
@@ -23,7 +25,7 @@ from aiotieba.api.get_posts._classdef import (
     UserInfo_p,
 )
 from aiotieba.api.get_threads import Thread, Threads
-from aiotieba.enums import CommentSortType, PostSortType, ThreadSortType
+from aiotieba.enums import CommentSortType, PostSortType, ReqUInfo, ThreadSortType
 from aiotieba.exception import BoolResponse, TiebaServerError
 from astrbot_plugin_tieba_moderator.core.models import (
     Author,
@@ -50,6 +52,8 @@ def gateway(monkeypatch):
         "get_posts",
         "get_comments",
         "get_image_bytes",
+        "get_self_info",
+        "get_bawu_info",
         "del_thread",
         "del_post",
         "recover_thread",
@@ -61,7 +65,7 @@ def gateway(monkeypatch):
     constructor = Mock(return_value=client)
     monkeypatch.setattr(module, "Client", constructor)
     instance = module.TiebaGateway("fake-bduss", "fake-stoken")
-    constructor.assert_called_once_with("fake-bduss", "fake-stoken")
+    constructor.assert_not_called()
     return instance, client
 
 
@@ -936,3 +940,145 @@ def test_close_unused_client(gateway):
     run(gw.close())
     client.__aenter__.assert_not_called()
     client.__aexit__.assert_not_called()
+
+
+def test_self_info_uses_installed_identity_fields_and_normalizes_portrait(gateway):
+    gw, client = gateway
+    client.get_self_info.return_value = UserInfo(
+        user_id=42, portrait="portrait?t=123", user_name="login",
+        nick_name_new="nickname", nick_name_old="old nickname",
+    )
+    result = run(gw.get_self_info())
+    assert result == module.SelfInfo(
+        user_id=42, portrait="portrait", user_name="login", nick_name="nickname"
+    )
+    client.get_self_info.assert_awaited_once_with(ReqUInfo.BASIC | ReqUInfo.NICK_NAME)
+    with pytest.raises(dcs.FrozenInstanceError):
+        result.user_id = 100
+
+
+def test_self_info_supports_blank_login_and_old_nickname(gateway):
+    gw, client = gateway
+    client.get_self_info.return_value = UserInfo(
+        user_id=42, portrait="portrait", nick_name_old="old nickname"
+    )
+    result = run(gw.get_self_info())
+    assert result.user_name == ""
+    assert result.nick_name == "old nickname"
+
+
+@pytest.mark.parametrize("response", [
+    UserInfo(), None, False, SimpleNamespace(),
+    UserInfo(user_id=-1, portrait="portrait"),
+    UserInfo(user_id=True, portrait="portrait"),
+    UserInfo(user_id="42", portrait="portrait"),
+    UserInfo(user_id=42),
+    UserInfo(user_id=42, portrait="?t=123"),
+    UserInfo(user_id=42, portrait=None),
+    UserInfo(user_id=42, portrait="portrait", user_name=None),
+    SimpleNamespace(user_id=42, portrait="portrait", user_name="", nick_name=None),
+])
+def test_invalid_self_info_is_tieba_action_error(gateway, response):
+    gw, client = gateway
+    client.get_self_info.return_value = response
+    with pytest.raises(TiebaActionError):
+        run(gw.get_self_info())
+
+
+@pytest.mark.parametrize("wrapped", [True, False])
+def test_self_info_request_failure_is_tieba_action_error(gateway, wrapped):
+    gw, client = gateway
+    error = TiebaServerError(4, "not logged in")
+    if wrapped:
+        response = UserInfo()
+        response.err = error
+        client.get_self_info.return_value = response
+    else:
+        client.get_self_info.side_effect = error
+    with pytest.raises(TiebaActionError, match="无法获取有效的贴吧账号信息"):
+        run(gw.get_self_info())
+
+
+@pytest.mark.parametrize("users,expected", [
+    ([UserInfo_bawu(user_id=42, portrait="other")], True),
+    ([UserInfo_bawu(user_id=0, portrait="portrait?t=100")], True),
+    ([UserInfo_bawu(user_id=7, portrait="other")], False),
+    ([UserInfo_bawu()], False),
+    ([], False),
+])
+def test_bawu_uses_real_team_all_members_and_stable_identity(gateway, users, expected):
+    gw, client = gateway
+    client.get_bawu_info.return_value = BawuInfo(all=users)
+    me = module.SelfInfo(
+        user_id=42, portrait="portrait?t=200", user_name="login", nick_name="nickname"
+    )
+    assert run(gw.is_bawu("forum", me)) is expected
+    client.get_bawu_info.assert_awaited_once_with("forum")
+
+
+def test_empty_bawu_identifiers_never_match(gateway):
+    gw, client = gateway
+    client.get_bawu_info.return_value = BawuInfo(all=[UserInfo_bawu()])
+    me = module.SelfInfo(user_id=0, portrait="", user_name="", nick_name="")
+    assert run(gw.is_bawu("forum", me)) is False
+
+
+@pytest.mark.parametrize("failure", ["exception", "wrapped", "none", "false", "malformed"])
+def test_bawu_query_failure_is_unknown_not_false(gateway, failure):
+    gw, client = gateway
+    error = TiebaServerError(4, "denied")
+    if failure == "exception":
+        client.get_bawu_info.side_effect = error
+    elif failure == "wrapped":
+        response = BawuInfo()
+        response.err = error
+        client.get_bawu_info.return_value = response
+    else:
+        client.get_bawu_info.return_value = {
+            "none": None, "false": False, "malformed": SimpleNamespace(all=None)
+        }[failure]
+    me = module.SelfInfo(user_id=42, portrait="portrait", user_name="", nick_name="")
+    assert run(gw.is_bawu("forum", me)) is None
+
+
+@pytest.mark.parametrize("operation", ["self", "bawu"])
+def test_account_checks_propagate_cancellation(gateway, operation):
+    gw, client = gateway
+    client.get_self_info.side_effect = asyncio.CancelledError
+    client.get_bawu_info.side_effect = asyncio.CancelledError
+    me = module.SelfInfo(user_id=42, portrait="portrait", user_name="", nick_name="")
+    with pytest.raises(asyncio.CancelledError):
+        run(gw.get_self_info() if operation == "self" else gw.is_bawu("forum", me))
+
+
+def test_client_constructed_only_once_on_first_authenticated_request(gateway):
+    gw, client = gateway
+    client.get_threads.return_value = Threads()
+
+    async def scenario():
+        module.Client.assert_not_called()
+        await asyncio.gather(gw.list_threads("first", 1), gw.list_threads("second", 1))
+        module.Client.assert_called_once_with("fake-bduss", "fake-stoken")
+        await gw.close()
+
+    run(scenario())
+
+
+def test_client_cookie_format_failure_is_deferred_and_redacted(monkeypatch):
+    client_factory = Mock(side_effect=ValueError("invalid cookie fake-secret-cookie"))
+    monkeypatch.setattr(module, "Client", client_factory)
+    gw = module.TiebaGateway("fake-secret-cookie", "fake-stoken")
+    client_factory.assert_not_called()
+    with pytest.raises(TiebaActionError) as caught:
+        run(gw.get_self_info())
+    assert str(caught.value) == "无法获取有效的贴吧账号信息"
+    assert "fake-secret-cookie" not in str(caught.value)
+    client_factory.assert_called_once_with("fake-secret-cookie", "fake-stoken")
+    run(gw.close())
+
+
+def test_unused_gateway_close_never_constructs_client(gateway):
+    gw, client = gateway
+    run(gw.close())
+    module.Client.assert_not_called()
+    client.__aexit__.assert_not_awaited()

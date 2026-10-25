@@ -3,6 +3,8 @@
 import { apiGet, apiPost, errorText, isConflict } from "./api.js";
 import { button, el, fmtConf, fmtInterval, fmtTime, setChildren, toast } from "./dom.js";
 
+const AUTO_DELETE_LABEL = "自动删除";
+
 const FIRST_POLL_MS = 1500;
 const POLL_MS = 5000;
 const IDLE_POLLS_BEFORE_DONE = 2;
@@ -18,7 +20,7 @@ const IDLE_POLLS_BEFORE_DONE = 2;
  *   {el, refresh({changed}), get(), dataVersion()}. dataVersion() increases whenever case data
  *   changed (an action succeeded or a patrol finished) so inactive tabs know to reload.
  */
-export function createStatusBar({ onOpenPending, onPatrolFinished }) {
+export function createStatusBar({ onOpenPending, onPatrolFinished, onOpenSettings }) {
   const root = el("section", { class: "kpis statusbar", "aria-label": "巡查状态" });
   let status = null;
   let loadError = "";
@@ -39,6 +41,30 @@ export function createStatusBar({ onOpenPending, onPatrolFinished }) {
     return `上一轮（${fmtTime(report.finished_at)}）${parts.join("，")}。`;
   }
 
+  /** One chip per forum: name, problem marker (已停用 / 未选择账号) and auto-delete marker. */
+  function forumChips(s) {
+    const forums = (s.forums || []).map((f) => (typeof f === "string" ? { fname: f, patrolled: true, problem: "" } : f));
+    if (!forums.length) {
+      return el("span", { class: "forum-empty" }, el("span", { class: "muted", text: "还没有配置吧" }), button("去设置", { variant: "link", onclick: onOpenSettings }));
+    }
+    return el(
+      "ul",
+      { class: "forum-chips", "aria-label": "各吧状态" },
+      forums.map((f) => {
+        const auto = f.auto_delete && f.auto_delete.enabled;
+        const parts = [`${f.fname}吧`];
+        if (f.problem) parts.push(f.problem);
+        const title = [f.account_name ? `账号：${f.account_name}` : "", auto ? `自动删除 ≥ ${fmtConf(f.auto_delete.threshold)}` : "", `上报 ≥ ${fmtConf(f.report_threshold)}`].filter(Boolean).join("；");
+        return el(
+          "li",
+          { class: `forum-chip${f.problem ? " is-problem" : ""}`, title },
+          el("span", { class: "forum-name", text: parts.join(" · ") }),
+          auto ? el("span", { class: "forum-auto", text: `${AUTO_DELETE_LABEL} ≥ ${fmtConf(f.auto_delete.threshold)}` }) : null,
+        );
+      }),
+    );
+  }
+
   function paint() {
     const finding = document.getElementById("finding");
     const actions = document.getElementById("head-actions");
@@ -55,13 +81,13 @@ export function createStatusBar({ onOpenPending, onPatrolFinished }) {
     if (actions) {
       setChildren(
         actions,
-        s.has_account ? null : el("span", { class: "warn-text", text: "未配置账号凭据" }),
+        s.has_account ? null : el("span", { class: "warn-text", text: "还没有添加吧务账号" }),
         loadError ? el("span", { class: "warn-text", text: loadError }) : null,
         button(running ? "巡查中…" : "立即巡查一轮", {
           variant: "primary",
           disabled: running || !s.has_account,
           "aria-busy": running ? "true" : null,
-          title: s.has_account ? null : "未配置账号凭据",
+          title: s.has_account ? null : "还没有添加吧务账号",
           onclick: runPatrol,
         }),
       );
@@ -74,11 +100,8 @@ export function createStatusBar({ onOpenPending, onPatrolFinished }) {
         el("span", { class: "kpi-label", text: "待处理" }),
         el("button", { type: "button", class: "kpi-value lead-btn", onclick: onOpenPending, "aria-label": `待处理 ${s.pending} 件，打开待处理列表` }, el("span", { class: s.pending === 0 ? "zero" : "", text: String(s.pending) }), el("span", { class: "unit", text: " 件" })),
       ),
-      cell("自动巡查", el("span", { class: `dot ${s.loop_running ? "dot-on" : "dot-off"}`, "aria-hidden": "true" }), patrolText),
-      cell("监控吧", (s.forums || []).length ? s.forums.map((f) => `${f}吧`).join("、") : "未配置"),
-      cell("巡查间隔", fmtInterval(s.interval_seconds)),
-      cell("自动删除", auto.enabled ? `开 · ≥ ${fmtConf(auto.threshold)}` : `关 · 阈值 ${fmtConf(auto.threshold)}`),
-      cell("上报阈值", `≥ ${fmtConf(s.report_threshold)}`),
+      cell("自动巡查", el("span", { class: `dot ${s.loop_running ? "dot-on" : "dot-off"}`, "aria-hidden": "true" }), el("span", { class: "nowrap", text: patrolText }), el("span", { class: "nowrap muted", text: `每 ${fmtInterval(s.interval_seconds)}` })),
+      el("div", { class: "kpi kpi-forums" }, el("span", { class: "kpi-label", text: "监控的吧" }), forumChips(s)),
     );
   }
 
@@ -141,7 +164,7 @@ export function createStatusBar({ onOpenPending, onPatrolFinished }) {
       watch(false, FIRST_POLL_MS);
     } catch (err) {
       if (isConflict(err)) {
-        toast("已有一轮手动巡查在进行");
+        toast(errorText(err));
         watch(true, FIRST_POLL_MS);
       } else {
         toast(errorText(err), "error");

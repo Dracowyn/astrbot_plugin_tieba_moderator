@@ -1,6 +1,7 @@
 // Tab 3: statistics (summary numbers, stacked bars drawn with CSS, hint, patrol reports).
 
 import { apiGet, errorText } from "./api.js";
+import { getSettings, loadSettings } from "./settings_store.js";
 import { ALL_STATUSES, STATUS_LABEL, button, el, emptyState, errorState, fmtDuration, setChildren, fmtTime, skeleton } from "./dom.js";
 
 const RANGES = [7, 30, 90];
@@ -123,7 +124,25 @@ function reportItem(report) {
   );
 }
 
+/**
+ * Effective thresholds for one forum (or the global defaults when `fname` is empty):
+ * from GET settings when loaded, else from the status payload.
+ */
+function thresholdsFor(fname, status) {
+  const settings = getSettings();
+  if (settings) {
+    const forum = fname ? settings.forums.find((f) => f.fname === fname) : null;
+    const o = forum ? forum.effective : settings.global.defaults;
+    return { enabled: o.auto_delete_enabled, threshold: o.auto_delete_threshold, report: o.report_threshold };
+  }
+  if (!status) return null;
+  const forum = fname ? (status.forums || []).find((f) => f.fname === fname) : null;
+  const auto = (forum ? forum.auto_delete : status.auto_delete) || {};
+  return { enabled: auto.enabled, threshold: auto.threshold, report: forum ? forum.report_threshold : status.report_threshold };
+}
+
 export function createStatsTab(ctx) {
+  let fname = "";
   let days = 30;
   let loading = false;
   let seenVersion = -1;
@@ -140,22 +159,32 @@ export function createStatsTab(ctx) {
       },
     }),
   );
+  const forumSelect = el("select", { id: "stats-forum", "aria-label": "按吧筛选" });
+  forumSelect.addEventListener("change", () => { fname = forumSelect.value; load(); });
   const refreshBtn = button("刷新", { onclick: () => load() });
   const content = el("div", { class: "stats-body" });
   const root = el(
     "section",
     { class: "tab-body" },
-    el("div", { class: "toolbar" }, el("h2", { class: "section-title", text: "统计" }), el("div", { class: "segmented", role: "group", "aria-label": "时间范围" }, rangeButtons), el("span", { class: "grow" }), refreshBtn),
+    el("div", { class: "toolbar" }, el("h2", { class: "section-title", text: "统计" }), el("div", { class: "segmented", role: "group", "aria-label": "时间范围" }, rangeButtons), forumSelect, el("span", { class: "grow" }), refreshBtn),
     content,
   );
 
+  /** Rebuild the forum filter from settings (or status) and keep the selection if it still exists. */
+  function fillForums() {
+    const names = getSettings() ? getSettings().forums.map((f) => f.fname) : (ctx.getStatus()?.forums || []).map((f) => f.fname);
+    if (fname && !names.includes(fname)) fname = "";
+    forumSelect.replaceChildren(el("option", { value: "", text: "全部吧" }), ...names.map((n) => el("option", { value: n, text: `${n}吧` })));
+    forumSelect.value = fname;
+  }
+
   function render(stats, reports) {
-    const status = ctx.getStatus();
+    const th = thresholdsFor(fname, ctx.getStatus());
     let lead = null;
     const notes = [];
-    if (status) {
-      const auto = status.auto_delete || {};
-      const main = hintData(auto.threshold, stats.confidence_buckets);
+    if (th) {
+      const main = hintData(th.threshold, stats.confidence_buckets);
+      const scope = fname ? `${fname}吧：` : "全局默认：";
       lead = el(
         "section",
         { class: "lead", "aria-label": "自动删除参考" },
@@ -163,9 +192,9 @@ export function createStatsTab(ctx) {
         el(
           "div",
           { class: "lead-text" },
-          el("strong", { text: `自动删除阈值 ${auto.threshold}${auto.enabled ? "" : "（当前未开启）"}` }),
+          el("strong", { text: `${scope}自动删除阈值 ${th.threshold}${th.enabled ? "" : "（当前未开启）"}` }),
           el("p", { text: main.text }),
-          ...(Math.abs(status.report_threshold - auto.threshold) > EPS ? [el("p", { class: "muted", text: `上报阈值 ${status.report_threshold}：${hintData(status.report_threshold, stats.confidence_buckets).text}` })] : []),
+          ...(Math.abs(th.report - th.threshold) > EPS ? [el("p", { class: "muted", text: `上报阈值 ${th.report}：${hintData(th.report, stats.confidence_buckets).text}` })] : []),
         ),
       );
     }
@@ -179,7 +208,7 @@ export function createStatsTab(ctx) {
         el("section", { class: "panel-card" }, el("h3", { text: "各类别处置结果" }), legend(), categoryChart(stats.by_category)),
         el("section", { class: "panel-card" }, el("h3", { text: "置信度分档（不含审查失败）" }), legend(), bucketChart(stats.confidence_buckets)),
       ),
-      el("section", { class: "panel-card" }, el("h3", { text: "最近巡查报告" }), reports.length ? el("ul", { class: "reports" }, reports.map(reportItem)) : emptyState("还没有巡查报告。")),
+      el("section", { class: "panel-card" }, el("h3", { text: "最近巡查报告（所有吧）" }), reports.length ? el("ul", { class: "reports" }, reports.map(reportItem)) : emptyState("还没有巡查报告。")),
     );
   }
 
@@ -189,7 +218,9 @@ export function createStatsTab(ctx) {
     refreshBtn.disabled = true;
     if (!content.firstChild) content.replaceChildren(skeleton(3, 5));
     try {
-      const [stats, reports] = await Promise.all([apiGet("stats", { days }), apiGet("reports", { limit: REPORT_LIMIT }), ctx.refreshStatus()]);
+      // Settings feed the forum filter and the thresholds; a failure there must not block the numbers.
+      const [stats, reports] = await Promise.all([apiGet("stats", { days, fname }), apiGet("reports", { limit: REPORT_LIMIT }), ctx.refreshStatus(), loadSettings().catch(() => null)]);
+      fillForums();
       render(stats, reports);
       lastLoad = Date.now();
       seenVersion = ctx.dataVersion();

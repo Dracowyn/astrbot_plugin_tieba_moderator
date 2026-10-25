@@ -1,6 +1,6 @@
 # 设计与模块契约
 
-本文是 v0.1.0 的实现契约：模块边界、接口签名、行为规则。面向维护者；使用说明见 README。
+本文保留 v0.1.0 的巡查、去重和案件行为契约。**v0.3.0 的设置、存储扩展、多账号与热生效以[设置契约](settings.md)为准**；本文旧配置格式与旧构造签名不再用于运行时。使用说明见 README。
 
 ## 1. 目标与边界
 
@@ -12,7 +12,7 @@
   - 其余不处理。
 - **封禁永远不自动执行**，只能由吧务确认；LLM 给出的封禁天数只是建议。
 - 自动删除默认关闭，新装插件先只推送，吧务观察一段时间判定质量后再开启。
-- 不做：网页爬取（网页端有百度安全验证）、循环封禁、多账号。
+- 不做：网页爬取（网页端有百度安全验证）、循环封禁；多账号按吧分配，不自动轮换。
 
 ## 2. 依赖与平台
 
@@ -33,8 +33,9 @@
 | `services/patrol.py` | 巡查编排：一轮巡查的完整流程 |
 | `services/case_service.py` | 吧务对案件的操作：删除、封禁、忽略、恢复 |
 | `services/llm_judge.py` | 调 AstrBot LLM 产生 `Verdict`，实现 `JudgeFn` |
-| `main.py` | 插件入口：配置解析、后台任务、指令、权限、推送文案 |
-| `_conf_schema.json` | 配置定义（键名见 §8） |
+| `main.py` | 插件入口：加载插件库设置、后台任务、指令、权限、推送文案 |
+| `core/settings.py` / `services/settings_service.py` | 冻结设置快照、继承解析、串行写入与热生效回调 |
+| `services/gateway_pool.py` | 按账号管理客户端，租约结束后关闭被替换或删除的客户端 |
 
 `core/` 不依赖 astrbot 和 aiotieba；`services/` 可以依赖 aiotieba，`llm_judge.py` 可以依赖 astrbot。
 
@@ -202,7 +203,7 @@ class CaseService:
 - `ban` 中删除成功、封禁失败：状态转为 `DELETED`，`note` 记封禁失败原因，再抛 `TiebaActionError`。
 - 封禁理由：`f"{verdict.category}：{verdict.reason}"` 截断到 50 字。
 
-## 8. 配置键（`_conf_schema.json`）
+## 8. 历史配置键（v0.1–v0.2，v0.3 不再读取）
 
 ```
 account.bduss, account.stoken                       # 吧务账号凭据
@@ -253,13 +254,18 @@ AstrBot ≥ 4.29 的插件视图：`views/<name>/index.html` 经 bridge 调用 `
 
 ## 12. v0.2 按吧配置
 
-配置格式、容错、吧名匹配、吧规与推送路由，以及按吧权限的完整约定见 [按吧配置契约](forum-config.md)。本节补充实现接口：
+吧名比较与权限隔离继续遵循[按吧配置契约](forum-config.md) §2、§5；旧配置格式已由[设置契约](settings.md)取代。
 
-- `core/forums.py` 的纯函数 `parse_forum_config(config)` 返回冻结的 `ForumConfig` 和英文 warning；`profiles` 使用只读映射，字段不反向改写原配置。巡查列表是全局 `forums` 与有效覆盖条目的保序并集，键统一为 `strip().casefold()`。
-- `ForumProfile.rules_overridden` / `sessions_overridden` 是用于状态标注的布尔元数据：有效非空的本吧值即为显式覆盖，即使与全局值相同；空值回落不标注。非空吧规保留原文本，展示吧名保留大小写但去掉首尾空白。
-- 契约未指定的畸形外层 `forums` / `forum_overrides` 按空列表处理；非字符串吧名跳过并记录 warning；解析器中的畸形全局 `judge` / `notify` 按空配置处理。
-- `LlmJudge(..., forum_rules: Mapping[str, str] | None = None)` 接收按规范化吧名索引的已回落吧规，构造时预建系统提示。普通审查和空临时吧规试判都按实际 `item.fname` 选择；非空临时吧规只影响该次试判。
-- `/tb bind [吧名]` 保存后重新解析配置，推送路由立即生效。首次本吧绑定只写入当前会话，不把继承的全局会话复制成本吧覆盖；已有覆盖只更新第一个有效条目的 `sessions`，其余条目及未知字段原样保留。
-- `Store.query_cases(..., fnames: tuple[str, ...] = ())` 提供参数化多吧过滤，计数与分页共用条件；与原有精确 `fname` 和其他条件取交集。调用方传入规范化键；按契约使用 SQLite `lower()`，仅折叠 ASCII 大小写，不提供完整 Unicode casefold 匹配。
-- 权限判断按契约 §5 独立接入；此处解析器只保留全局操作员与本吧吧务字段，不提供授权判断函数。Web 状态沿用统一的 `PatrolSettings.forums`，无需重复解析。
+- `ForumConfig.from_snapshot(snapshot)` 从插件库快照构造只读权限视图，停用或未选择账号的吧仍保留本吧吧务权限。
+- `SettingsService.bind_session` 写插件库，首次本吧绑定只写当前会话，不复制继承的全局会话。
+- `Store.query_cases(..., fnames: tuple[str, ...] = ())` 仍提供参数化多吧过滤；SQLite `lower()` 仅折叠 ASCII，非 ASCII 大写吧名可能漏列，但不会扩大权限。
+
+## 13. v0.3 运行时
+
+- 每轮巡查在串行锁内读取一次 `SettingsSnapshot`，随即租用所有参与账号的网关，直到整轮判定、处置、通知和标记完成后释放。读预算按账号共享，全局条目与判定并发上限不变；代码内页数与失败上限由 `PatrolLimits` 保留。
+- `LlmJudge` 根据实际帖子所在吧选择模型与吧规，按吧规文本缓存系统提示；巡查显式传入整轮快照，独立试判使用调用时快照。
+- `CaseService` 在处置锁内按案件所属吧解析账号，网关租约覆盖删除、封禁、恢复及数据库迁移。未配置吧或没有可用账号时报「X 吧没有可用的吧务账号」；忽略案件无需远端账号。
+- 设置写锁覆盖数据库提交、快照替换与 `on_change(old, new)`。回调先更新网关池，再唤醒调度等待，不等待当前巡查；当前轮自然结束后启动按新间隔等待的循环，避免回调与巡查互相等待。
+- 网关池更换凭据或删除账号时先发布新映射，将旧客户端标为退役；最后一个租约释放后才关闭。关闭任务受到取消保护，插件终止时等待所有使用者和关闭任务结束，再关闭数据库。
+- 本后端阶段保留现有 Web 响应结构；设置 API、扩展状态字段和前端分别由设置契约 §4–§6 的后端 B 与前端工作接入。
 

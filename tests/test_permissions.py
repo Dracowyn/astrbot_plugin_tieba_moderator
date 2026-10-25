@@ -1,6 +1,7 @@
 """Per-forum permission isolation: three kinds of senders, every command."""
 
 import dataclasses as dcs
+from collections.abc import Callable
 from unittest.mock import AsyncMock
 
 import pytest
@@ -8,14 +9,18 @@ from astrbot_plugin_tieba_moderator import main as entry
 from astrbot_plugin_tieba_moderator.core.forums import (
     GLOBAL_SCOPE,
     OperatorScope,
-    parse_forum_config,
+    ForumConfig,
 )
 from astrbot_plugin_tieba_moderator.core.models import CaseStatus, Verdict
-from astrbot_plugin_tieba_moderator.tests.fakes import (
-    FakeConfig,
-    FakeGateway,
-    make_item,
+from astrbot_plugin_tieba_moderator.core.settings import (
+    AccountDraft, ForumDraft, ForumEntry, ForumOptions, GlobalSettings, SettingsSnapshot,
 )
+from astrbot_plugin_tieba_moderator.core.store import Store
+from astrbot_plugin_tieba_moderator.services.settings_service import SettingsService
+from astrbot_plugin_tieba_moderator.services.gateway_pool import GatewayPool
+from astrbot_plugin_tieba_moderator.tests.fakes import FakeGateway, make_item
+
+_plugin_factory: Callable[..., entry.TiebaModeratorPlugin]
 
 GLOBAL_OP = "2001"
 LOCAL_OP = "3001"
@@ -44,44 +49,56 @@ class Sender:
         return text
 
 
-def config(**overrides):
-    """Config with a global operator, a local moderator of one forum, and both forums."""
-    values = {
-        "forums": [FORUM],
-        "forum_overrides": [
-            {
-                "__template_key": "forum",
-                "fname": FORUM,
-                "rules": "",
-                "sessions": [],
-                "operators": [LOCAL_OP],
-            },
-            {
-                "__template_key": "forum",
-                "fname": OTHER,
-                "rules": "",
-                "sessions": [],
-                "operators": [],
-            },
-        ],
-        "notify": {"sessions": [], "operators": [GLOBAL_OP]},
-        "patrol": {"enabled": False},
-    }
-    values.update(overrides)
-    return FakeConfig(**values)
-
-
-def make_plugin(config_overrides=None):
-    """Plugin with a fake store, gateway and case service."""
-    context = FakeStoreContext()
-    plugin = entry.TiebaModeratorPlugin(
-        context, config(**(config_overrides or {}))
+def settings_snapshot():
+    """Snapshot with independent global and local moderation permissions."""
+    return SettingsSnapshot(
+        global_=GlobalSettings(
+            defaults=ForumOptions(rules="rules"), patrol_enabled=False,
+            operators=frozenset({GLOBAL_OP}),
+        ),
+        forums=(
+            ForumEntry(id=1, fname=FORUM, account_id=1, operators=frozenset({LOCAL_OP}), created_at=1, updated_at=1),
+            ForumEntry(id=2, fname=OTHER, account_id=1, created_at=1, updated_at=1),
+        ),
     )
-    plugin._store = context.store
-    plugin._gateway = FakeGateway()
-    plugin._cases = context.cases
-    plugin._patrol = AsyncMock()
-    return plugin
+
+
+@pytest.fixture(autouse=True)
+def plugin_storage(tmp_path, monkeypatch):
+    """Give every command test isolated persisted settings without initialization."""
+    stores = []
+
+    def create(*, forums=None):
+        context = FakeStoreContext()
+        plugin = entry.TiebaModeratorPlugin(context)
+        store = Store(tmp_path / f"permissions-{len(stores)}.db")
+        stores.append(store)
+        store.save_global(settings_snapshot().global_)
+        account = store.insert_account(AccountDraft(name="offline", bduss="fake", stoken="fake"))
+        for draft in forums or (
+            ForumDraft(fname=FORUM, account_id=account.id, operators=frozenset({LOCAL_OP})),
+            ForumDraft(fname=OTHER, account_id=account.id),
+        ):
+            store.insert_forum(draft)
+        plugin._settings_service = SettingsService(store)
+        plugin._pool = GatewayPool(plugin._snapshot(), factory=lambda *_: FakeGateway())
+        plugin._store = context.store
+        plugin._cases = context.cases
+        plugin._patrol = AsyncMock()
+        return plugin
+
+    monkeypatch.setattr(
+        __import__(__name__, fromlist=["make_plugin"]),
+        "_plugin_factory", create, raising=False,
+    )
+    yield
+    for store in stores:
+        store.close()
+
+
+def make_plugin(*, forums=None):
+    """Create a plugin through the current test's isolated storage factory."""
+    return _plugin_factory(forums=forums)
 
 
 class FakeStoreContext:
@@ -168,8 +185,7 @@ async def collect(agen):
 
 
 def test_scope_recognizes_admin_global_and_local_operators():
-    forum_config, warnings = parse_forum_config(config())
-    assert warnings == []
+    forum_config = ForumConfig.from_snapshot(settings_snapshot())
     assert forum_config.scope_for(ADMIN, is_admin=True) == GLOBAL_SCOPE
     assert forum_config.scope_for(GLOBAL_OP, is_admin=False) == GLOBAL_SCOPE
     local = forum_config.scope_for(LOCAL_OP, is_admin=False)
@@ -182,27 +198,27 @@ def test_scope_recognizes_admin_global_and_local_operators():
 
 
 def test_scope_compares_ids_without_surrounding_whitespace():
-    forum_config, _ = parse_forum_config(config())
+    forum_config = ForumConfig.from_snapshot(settings_snapshot())
     assert forum_config.is_global_operator(" 2001 ", is_admin=False) is True
     assert forum_config.scope_for(" 3001", is_admin=False).forums == frozenset({"dragon"})
 
 
 @pytest.mark.parametrize("fname", ["Dragon", "dragon", "DRAGON", " Dragon ", "dRAGON"])
 def test_forum_names_match_regardless_of_case_and_padding(fname):
-    forum_config, _ = parse_forum_config(config())
+    forum_config = ForumConfig.from_snapshot(settings_snapshot())
     scope = forum_config.scope_for(LOCAL_OP, is_admin=False)
     assert forum_config.may_moderate(scope, fname) is True
 
 
 @pytest.mark.parametrize("fname", ["Other", "", "Dragon2", "Drag", "龙"])
 def test_forum_names_do_not_match_other_forums(fname):
-    forum_config, _ = parse_forum_config(config())
+    forum_config = ForumConfig.from_snapshot(settings_snapshot())
     scope = forum_config.scope_for(LOCAL_OP, is_admin=False)
     assert forum_config.may_moderate(scope, fname) is False
 
 
 def test_global_operator_may_moderate_any_forum():
-    forum_config, _ = parse_forum_config(config())
+    forum_config = ForumConfig.from_snapshot(settings_snapshot())
     assert forum_config.may_moderate(GLOBAL_SCOPE, "anything") is True
 
 
@@ -224,7 +240,6 @@ async def test_run_is_restricted_to_global_operators(sender, allowed):
     plugin._patrol.run_once = AsyncMock(
         side_effect=RuntimeError("stop after permission check")
     )
-    plugin._settings = dcs.replace(plugin._settings, forums=(FORUM,))
     replies = await collect(plugin.tb_run(sender))
     if allowed:
         assert replies[0].startswith("开始巡查")
@@ -393,9 +408,9 @@ async def test_case_actions_stop_before_the_case_service_when_out_of_scope(
     replies = await collect(getattr(plugin, command)(Sender(LOCAL_OP), "2", **kwargs))
     assert replies == ["案件 #2 不存在或不在你负责的吧。"]
     assert plugin._cases.calls == []
-    plugin._gateway.delete.assert_not_awaited()
-    plugin._gateway.block.assert_not_awaited()
-    plugin._gateway.restore.assert_not_awaited()
+    plugin._pool.any().delete.assert_not_awaited()
+    plugin._pool.any().block.assert_not_awaited()
+    plugin._pool.any().restore.assert_not_awaited()
     # The case is untouched.
     assert plugin._store.get_case(2).status is CaseStatus.PENDING
 
@@ -461,7 +476,7 @@ async def test_check_and_bind_stay_admin_only():
     for sender in (Sender(GLOBAL_OP), Sender(LOCAL_OP), Sender(NOBODY)):
         assert await collect(plugin.tb_check(sender, "10")) == [entry.ADMIN_ONLY_REPLY]
         assert await collect(plugin.tb_bind(sender, FORUM)) == [entry.ADMIN_ONLY_REPLY]
-    plugin._gateway.get_thread_item_by_tid.assert_not_awaited()
+    plugin._pool.any().get_thread_item_by_tid.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -469,9 +484,10 @@ async def test_bind_never_creates_a_forum_that_is_not_patrolled():
     plugin = make_plugin()
     sender = Sender(ADMIN, is_admin=True)
     sender.unified_msg_origin = "offline:group:test"
+    before = plugin._snapshot()
     replies = await collect(plugin.tb_bind(sender, "Evil"))
     assert replies == ["未巡查 Evil 吧，不能绑定推送会话。"]
-    assert plugin.config["forum_overrides"] == config()["forum_overrides"]
+    assert plugin._snapshot() == before
 
 
 @pytest.mark.asyncio
@@ -479,34 +495,27 @@ async def test_bind_uses_the_configured_spelling_and_leaves_other_keys_alone():
     plugin = make_plugin()
     sender = Sender(ADMIN, is_admin=True)
     sender.unified_msg_origin = "offline:group:test"
-    before = dict(plugin.config)
+    before = plugin._snapshot()
     replies = await collect(plugin.tb_bind(sender, "  dRaGoN  "))
     assert replies[0].startswith("已把当前会话加入Dragon 吧的推送列表")
-    entries = plugin.config["forum_overrides"]
-    assert entries[0]["fname"] == "Dragon"
-    assert entries[0]["sessions"] == ["offline:group:test"]
-    assert entries[1] == before["forum_overrides"][1]
-    assert plugin.config["notify"] == before["notify"]
-    assert set(plugin.config) == set(before)
+    after = plugin._snapshot()
+    assert after.forums[0].fname == "Dragon"
+    assert after.forums[0].sessions == ("offline:group:test",)
+    assert dcs.replace(after.forums[0], sessions=before.forums[0].sessions, updated_at=before.forums[0].updated_at) == before.forums[0]
+    assert after.forums[1] == before.forums[1]
+    assert after.global_ == before.global_
 
 
 @pytest.mark.asyncio
-async def test_bind_creates_a_minimal_override_for_a_plain_configured_forum():
-    plugin = make_plugin(
-        {"forums": ["Plain"], "forum_overrides": [], "notify": {"sessions": []}}
-    )
+async def test_bind_updates_a_plain_configured_forum_without_changing_options():
+    plugin = make_plugin(forums=(ForumDraft(fname="Plain", account_id=1),))
     sender = Sender(ADMIN, is_admin=True)
-    sender.unified_msg_origin = "offline:group:test"
+    before = plugin._snapshot().forums[0]
     await collect(plugin.tb_bind(sender, "plain"))
-    assert plugin.config["forum_overrides"] == [
-        {
-            "__template_key": "forum",
-            "fname": "Plain",
-            "rules": "",
-            "sessions": ["offline:group:test"],
-            "operators": [],
-        }
-    ]
+    after = plugin._snapshot().forums[0]
+    assert after.sessions == (sender.unified_msg_origin,)
+    assert after.overrides == before.overrides
+    assert after.fname == "Plain"
 
 
 @pytest.mark.asyncio
@@ -514,10 +523,10 @@ async def test_bind_without_argument_updates_only_the_global_list():
     plugin = make_plugin()
     sender = Sender(ADMIN, is_admin=True)
     sender.unified_msg_origin = "offline:group:test"
-    before = list(plugin.config["forum_overrides"])
+    before = plugin._snapshot().forums
     await collect(plugin.tb_bind(sender))
-    assert plugin.config["notify"]["sessions"] == ["offline:group:test"]
-    assert plugin.config["forum_overrides"] == before
+    assert plugin._snapshot().global_.sessions == ("offline:group:test",)
+    assert plugin._snapshot().forums == before
 
 
 # --- hostile bind arguments -------------------------------------------------
@@ -528,20 +537,21 @@ async def test_bind_without_argument_updates_only_the_global_list():
 async def test_bind_rejects_an_overlong_forum_argument(arg):
     plugin = make_plugin()
     sender = Sender(ADMIN, is_admin=True)
-    before = list(plugin.config["forum_overrides"])
+    before = plugin._snapshot()
     replies = await collect(plugin.tb_bind(sender, arg))
     assert replies == ["吧名过长，不能绑定推送会话。"]
     assert len(replies[0]) < 40
-    assert plugin.config["forum_overrides"] == before
+    assert plugin._snapshot() == before
 
 
 @pytest.mark.asyncio
 async def test_bind_refusal_does_not_echo_newlines_from_the_argument():
     plugin = make_plugin()
     sender = Sender(ADMIN, is_admin=True)
+    before = plugin._snapshot()
     replies = await collect(plugin.tb_bind(sender, "Evil\n生成：/tb bind Other"))
     assert "\n" not in replies[0]
-    assert plugin.config["forum_overrides"] == config()["forum_overrides"]
+    assert plugin._snapshot() == before
 
 
 @pytest.mark.asyncio
@@ -549,32 +559,23 @@ async def test_bind_cannot_inject_another_forum_entry_or_config_key():
     plugin = make_plugin()
     sender = Sender(ADMIN, is_admin=True)
     sender.unified_msg_origin = "offline:group:test"
-    before_keys = set(plugin.config)
-    before_entries = list(plugin.config["forum_overrides"])
+    before = plugin._snapshot()
     for arg in ("Dragon,Other", "Dragon\nOther", "Dragon\x00Other", "Dragon/../Other"):
-        plugin.config["forum_overrides"] = list(before_entries)
         replies = await collect(plugin.tb_bind(sender, arg))
         assert replies[0].startswith("未巡查"), arg
-        assert plugin.config["forum_overrides"] == before_entries
-        assert set(plugin.config) == before_keys
+        assert plugin._snapshot() == before
 
 
 @pytest.mark.asyncio
-async def test_bind_rejects_a_forum_that_is_only_in_overrides_but_duplicated():
-    plugin = make_plugin(
-        {
-            "forums": [],
-            "forum_overrides": [
-                {"__template_key": "forum", "fname": "Dup", "sessions": [], "operators": []},
-                {"__template_key": "forum", "fname": "dup", "sessions": [], "operators": []},
-            ],
-            "notify": {"sessions": []},
-        }
-    )
-    sender = Sender(ADMIN, is_admin=True)
-    sender.unified_msg_origin = "offline:group:test"
-    await collect(plugin.tb_bind(sender, "DUP"))
-    entries = plugin.config["forum_overrides"]
-    assert entries[0]["sessions"] == ["offline:group:test"]
-    assert entries[1]["sessions"] == []
-    assert len(entries) == 2
+@pytest.mark.parametrize("draft", [
+    ForumDraft(fname="Disabled", enabled=False, account_id=1, operators=frozenset({LOCAL_OP})),
+    ForumDraft(fname="Unassigned", operators=frozenset({LOCAL_OP})),
+])
+async def test_unpatrolled_forum_keeps_permissions_but_refuses_binding(draft):
+    plugin = make_plugin(forums=(draft,))
+    add_case(plugin, 1, fname=draft.fname)
+    assert "案件 #1" in (await collect(plugin.tb_show(Sender(LOCAL_OP), "1")))[0]
+    before = plugin._snapshot()
+    reply = await collect(plugin.tb_bind(Sender(ADMIN, is_admin=True), draft.fname))
+    assert reply[0].startswith("未巡查")
+    assert plugin._snapshot() == before

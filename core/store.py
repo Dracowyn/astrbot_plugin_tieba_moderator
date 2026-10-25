@@ -25,6 +25,19 @@ from .models import (
     PatrolReport,
     Verdict,
 )
+from .settings import (
+    Account,
+    AccountDraft,
+    ForumDraft,
+    ForumEntry,
+    GlobalSettings,
+    SettingsSnapshot,
+    default_global_settings,
+    forum_data_from_dict,
+    forum_data_to_dict,
+    global_from_dict,
+    global_to_dict,
+)
 
 
 class Store:
@@ -87,12 +100,207 @@ class Store:
                 deferred INTEGER NOT NULL,
                 errors TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS settings_global (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                data TEXT NOT NULL,
+                revision INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                bduss TEXT NOT NULL,
+                stoken TEXT NOT NULL,
+                created_at INTEGER,
+                updated_at INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS forums (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                fname TEXT NOT NULL,
+                fname_key TEXT NOT NULL UNIQUE,
+                data TEXT NOT NULL,
+                created_at INTEGER,
+                updated_at INTEGER
+            );
             """
         )
 
     def close(self) -> None:
         """Close the database connection and release its resources."""
         self._connection.close()
+
+    def load_settings(self) -> SettingsSnapshot:
+        """Read all settings in one transaction, defaulting an absent global row.
+
+        Returns:
+            Immutable settings from a single SQLite read snapshot. Reading an
+            empty database does not insert defaults or advance its revision.
+        """
+        with self._connection:
+            self._connection.execute("BEGIN")
+            global_row = self._connection.execute(
+                "SELECT data, revision FROM settings_global WHERE id = 1"
+            ).fetchone()
+            accounts = self._connection.execute(
+                "SELECT * FROM accounts ORDER BY id"
+            ).fetchall()
+            forums = self._connection.execute(
+                "SELECT * FROM forums ORDER BY id"
+            ).fetchall()
+        return SettingsSnapshot(
+            global_=(
+                global_from_dict(json.loads(global_row["data"]))
+                if global_row is not None
+                else default_global_settings()
+            ),
+            revision=global_row["revision"] if global_row is not None else 0,
+            accounts=tuple(Account(**dict(row)) for row in accounts),
+            forums=tuple(_forum_from_row(row) for row in forums),
+        )
+
+    def save_global(self, value: GlobalSettings) -> int:
+        """Replace global settings atomically and return the new revision."""
+        with self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO settings_global (id, data, revision) VALUES (1, ?, 1)
+                ON CONFLICT(id) DO UPDATE SET
+                    data = excluded.data, revision = settings_global.revision + 1
+                """,
+                (json.dumps(global_to_dict(value), ensure_ascii=False),),
+            )
+            revision = self._connection.execute(
+                "SELECT revision FROM settings_global WHERE id = 1"
+            ).fetchone()[0]
+        return revision
+
+    def _bump_revision(self) -> None:
+        """Advance settings revision inside the caller's mutation transaction."""
+        self._connection.execute(
+            """
+            INSERT INTO settings_global (id, data, revision) VALUES (1, ?, 1)
+            ON CONFLICT(id) DO UPDATE SET revision = settings_global.revision + 1
+            """,
+            (
+                json.dumps(
+                    global_to_dict(default_global_settings()), ensure_ascii=False
+                ),
+            ),
+        )
+
+    def insert_account(self, draft: AccountDraft) -> Account:
+        """Insert a validated account and advance revision in the same commit."""
+        now = int(self._clock())
+        with self._connection:
+            cursor = self._connection.execute(
+                """
+                INSERT INTO accounts (name, bduss, stoken, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (draft.name, draft.bduss, draft.stoken, now, now),
+            )
+            row = self._connection.execute(
+                "SELECT * FROM accounts WHERE id = ?", (cursor.lastrowid,)
+            ).fetchone()
+            self._bump_revision()
+        return Account(**dict(row))
+
+    def update_account(self, account_id: int, draft: AccountDraft) -> Account | None:
+        """Replace an account's name and supplied credentials, or return None.
+
+        Args:
+            account_id: Existing account identity.
+            draft: Validated account; missing or empty credentials keep old ones.
+
+        Returns:
+            Updated immutable account, or None without a revision for missing IDs.
+        """
+        with self._connection:
+            cursor = self._connection.execute(
+                """
+                UPDATE accounts SET name = ?, bduss = COALESCE(NULLIF(?, ''), bduss),
+                    stoken = COALESCE(NULLIF(?, ''), stoken), updated_at = ?
+                WHERE id = ?
+                """,
+                (draft.name, draft.bduss, draft.stoken, int(self._clock()), account_id),
+            )
+            if cursor.rowcount == 0:
+                return None
+            row = self._connection.execute(
+                "SELECT * FROM accounts WHERE id = ?", (account_id,)
+            ).fetchone()
+            self._bump_revision()
+        return Account(**dict(row))
+
+    def delete_account(self, account_id: int) -> bool:
+        """Delete an unreferenced account; service callers enforce references."""
+        with self._connection:
+            cursor = self._connection.execute(
+                "DELETE FROM accounts WHERE id = ?", (account_id,)
+            )
+            if cursor.rowcount == 0:
+                return False
+            self._bump_revision()
+        return True
+
+    def insert_forum(self, draft: ForumDraft) -> ForumEntry:
+        """Insert a validated forum with a unique, stripped casefolded name key."""
+        name = draft.fname.strip()
+        now = int(self._clock())
+        with self._connection:
+            cursor = self._connection.execute(
+                """
+                INSERT INTO forums (fname, fname_key, data, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    name,
+                    name.casefold(),
+                    json.dumps(forum_data_to_dict(draft), ensure_ascii=False),
+                    now,
+                    now,
+                ),
+            )
+            row = self._connection.execute(
+                "SELECT * FROM forums WHERE id = ?", (cursor.lastrowid,)
+            ).fetchone()
+            self._bump_revision()
+        return _forum_from_row(row)
+
+    def update_forum(self, forum_id: int, draft: ForumDraft) -> ForumEntry | None:
+        """Replace a forum's editable fields, keeping its identity and creation time."""
+        name = draft.fname.strip()
+        with self._connection:
+            cursor = self._connection.execute(
+                """
+                UPDATE forums SET fname = ?, fname_key = ?, data = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    name,
+                    name.casefold(),
+                    json.dumps(forum_data_to_dict(draft), ensure_ascii=False),
+                    int(self._clock()),
+                    forum_id,
+                ),
+            )
+            if cursor.rowcount == 0:
+                return None
+            row = self._connection.execute(
+                "SELECT * FROM forums WHERE id = ?", (forum_id,)
+            ).fetchone()
+            self._bump_revision()
+        return _forum_from_row(row)
+
+    def delete_forum(self, forum_id: int) -> bool:
+        """Delete a forum and advance revision only when the identity exists."""
+        with self._connection:
+            cursor = self._connection.execute(
+                "DELETE FROM forums WHERE id = ?", (forum_id,)
+            )
+            if cursor.rowcount == 0:
+                return False
+            self._bump_revision()
+        return True
 
     def get_thread_mark(self, tid: int) -> int | None:
         """Read the last processed thread activity timestamp.
@@ -527,4 +735,15 @@ def _case_from_row(row: sqlite3.Row) -> Case:
         handled_by=row["handled_by"],
         handled_at=row["handled_at"],
         note=row["note"],
+    )
+
+
+def _forum_from_row(row: sqlite3.Row) -> ForumEntry:
+    """Restore a forum's identity, timestamps, and typed immutable JSON fields."""
+    return ForumEntry(
+        id=row["id"],
+        fname=row["fname"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        **forum_data_from_dict(json.loads(row["data"])),
     )

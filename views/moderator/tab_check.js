@@ -1,8 +1,8 @@
 // Tab 4: trial judgement of one thread (review only, nothing is handled).
 
-import { apiPost, errorText, isConflict } from "./api.js";
+import { apiPost, errorText } from "./api.js";
 import { itemBody, verdictMeta } from "./card.js";
-import { ACTION_LABEL, authorText, button, el, errorState, kindText, spinner } from "./dom.js";
+import { ACTION_LABEL, authorText, button, el, errorState, fmtConf, kindText, spinner } from "./dom.js";
 
 const MAX_RULES = 8000;
 const MAX_TID_DIGITS = 18;
@@ -10,6 +10,11 @@ const MAX_TID_DIGITS = 18;
 function resultPanel(data) {
   const { item, verdict } = data;
   const failed = verdict.category === "审查失败";
+  const forum = data.fname || item.fname;
+  const th = data.thresholds;
+  const thText = th
+    ? `${forum}吧的阈值：自动删除 ${th.auto_delete.enabled ? "开" : "关"}（≥ ${fmtConf(th.auto_delete.threshold)}）· 上报 ≥ ${fmtConf(th.report_threshold)}`
+    : "";
   const partial = data.images_reviewed < data.images_total;
   return el(
     "section",
@@ -17,17 +22,18 @@ function resultPanel(data) {
     el(
       "div",
       { class: "result-head" },
+      el("span", { class: "chip chip-forum", text: `${forum}吧` }),
       el("span", { class: `chip ${verdict.violation ? "chip-deleted" : "chip-restored"}`, text: verdict.violation ? "判定违规" : "未发现违规" }),
-      el("span", { class: `chip chip-action-${data.action}`, text: `按当前阈值：${ACTION_LABEL[data.action] || data.action}` }),
+      el("span", { class: `chip chip-action-${data.action}`, text: `处置：${ACTION_LABEL[data.action] || data.action}` }),
       el("span", { class: partial ? "warn-text" : "muted", text: `图片已审查 ${data.images_reviewed} / ${data.images_total} 张` }),
     ),
+    thText ? el("p", { class: "muted", text: thText }) : null,
     verdictMeta(verdict, failed),
     verdict.reason ? el("p", { class: "reason", text: verdict.reason }) : null,
     el("hr", { class: "divider" }),
     el(
       "div",
       { class: "tags" },
-      el("span", { class: "chip chip-forum", text: `${item.fname}吧` }),
       el("span", { class: "chip chip-kind", text: kindText(item) }),
       el("span", { class: "muted", text: `作者 ${authorText(item.author)}` }),
     ),
@@ -85,7 +91,7 @@ export function createCheckTab() {
     try {
       output.replaceChildren(resultPanel(await apiPost("check", body)));
     } catch (err) {
-      output.replaceChildren(errorState(isConflict(err) ? "已有一次试判在进行" : errorText(err)));
+      output.replaceChildren(errorState(errorText(err)));
     } finally {
       submit.disabled = false;
       submit.textContent = "开始试判";

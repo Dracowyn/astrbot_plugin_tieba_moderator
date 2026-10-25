@@ -29,10 +29,20 @@ export function createPendingTab(ctx) {
   let lastLoad = 0;
   let seenVersion = -1;
 
+  /** First run: nothing is patrolled yet, so point to the settings tab. */
+  function guideState() {
+    return el(
+      "div",
+      { class: "state state-empty state-guide" },
+      el("div", { class: "guide-text" }, el("strong", { text: "先在设置里添加账号和吧" }), el("span", { class: "muted", text: "巡查需要至少一个吧务账号，和一个已启用并选好账号的吧。" })),
+      button("打开设置", { variant: "primary", onclick: () => ctx.openTab("settings") }),
+    );
+  }
+
   function paintCount() {
     count.textContent = `共 ${total} 件`;
     moreBtn.hidden = cards.size >= total;
-    if (cards.size === 0 && !loading) stateBox.replaceChildren(emptyState("没有待处理的案件。"));
+    if (cards.size === 0 && !loading) stateBox.replaceChildren(ctx.getStatus()?.configured === false ? guideState() : emptyState("没有待处理的案件。"));
     else if (stateBox.firstChild?.classList?.contains("state-empty")) stateBox.replaceChildren();
   }
 

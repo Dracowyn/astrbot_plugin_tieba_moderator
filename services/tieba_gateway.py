@@ -18,7 +18,7 @@ from typing import Any
 import aiohttp
 from aiotieba import Client
 from aiotieba.api.get_posts._classdef import Thread_p
-from aiotieba.enums import CommentSortType, PostSortType, ThreadSortType
+from aiotieba.enums import CommentSortType, PostSortType, ReqUInfo, ThreadSortType
 
 from ..core.models import (
     ALLOWED_BAN_DAYS,
@@ -130,6 +130,16 @@ class ReadBudget:
         if not self.remaining:
             raise RequestBudgetExceeded("Tieba read request budget exhausted")
         self.used += 1
+
+
+@dcs.dataclass(frozen=True, kw_only=True)
+class SelfInfo:
+    """Credential-free identity returned by the authenticated Tieba account."""
+
+    user_id: int
+    portrait: str
+    user_name: str
+    nick_name: str
 
 
 @dcs.dataclass(frozen=True, kw_only=True)
@@ -245,7 +255,7 @@ def _image_type(data: bytes) -> str:
 
 
 class TiebaGateway:
-    """Own a lazily entered, long-lived aiotieba client.
+    """Own a lazily constructed and entered, long-lived aiotieba client.
 
     Args:
         bduss: Moderator account BDUSS.
@@ -253,7 +263,9 @@ class TiebaGateway:
     """
 
     def __init__(self, bduss: str, stoken: str) -> None:
-        self._client = Client(bduss, stoken)
+        self._bduss = bduss
+        self._stoken = stoken
+        self._client: Client | None = None
         self._lifecycle_lock = asyncio.Lock()
         self._entered = False
         self._closed = False
@@ -264,6 +276,8 @@ class TiebaGateway:
             if self._closed:
                 raise TiebaActionError("Tieba gateway is closed")
             if not self._entered:
+                if self._client is None:
+                    self._client = Client(self._bduss, self._stoken)
                 await self._client.__aenter__()
                 self._entered = True
 
@@ -313,6 +327,63 @@ class TiebaGateway:
             raise TiebaActionError(_failure(operation, "unsuccessful response"))
         return response
 
+    async def get_self_info(self) -> SelfInfo:
+        """Return the authenticated identity, rejecting empty login responses.
+
+        Returns:
+            Immutable public identity with the portrait timestamp removed.
+
+        Raises:
+            TiebaActionError: Login fails or the response has no valid identity.
+        """
+        try:
+            user = await self._request(
+                "get_self_info", ReqUInfo.BASIC | ReqUInfo.NICK_NAME
+            )
+        except TiebaActionError:
+            raise TiebaActionError("无法获取有效的贴吧账号信息") from None
+        user_id = getattr(user, "user_id", 0)
+        portrait = getattr(user, "portrait", "")
+        user_name = getattr(user, "user_name", "")
+        nick_name = getattr(user, "nick_name", "")
+        if (
+            type(user_id) is not int
+            or user_id <= 0
+            or not isinstance(portrait, str)
+            or not portrait.partition("?t=")[0]
+            or not isinstance(user_name, str)
+            or not isinstance(nick_name, str)
+        ):
+            raise TiebaActionError("无法获取有效的贴吧账号信息")
+        return SelfInfo(
+            user_id=user_id,
+            portrait=portrait.partition("?t=")[0],
+            user_name=user_name,
+            nick_name=nick_name,
+        )
+
+    async def is_bawu(self, fname: str, me: SelfInfo) -> bool | None:
+        """Check all moderator roles using stable user ids or portraits.
+
+        Args:
+            fname: Forum whose moderator team should be queried.
+            me: Authenticated account identity from ``get_self_info``.
+
+        Returns:
+            Membership, or None when the team cannot be queried reliably.
+        """
+        try:
+            team = await self._request("get_bawu_info", fname)
+            portrait = me.portrait.partition("?t=")[0]
+            # aiotieba 4.8.1 exposes BawuInfo.all, not an iterable response.
+            return any(
+                (me.user_id > 0 and user.user_id == me.user_id)
+                or bool(portrait and user.portrait.partition("?t=")[0] == portrait)
+                for user in team.all
+            )
+        except (TiebaActionError, AttributeError, TypeError):
+            return None
+
     async def close(self) -> None:
         """Release the client once; closing an unused gateway needs no session.
 
@@ -326,7 +397,7 @@ class TiebaGateway:
             if self._image_session is not None:
                 await self._image_session.close()
                 self._image_session = None
-            if self._entered:
+            if self._entered and self._client is not None:
                 await self._client.__aexit__(None, None, None)
 
     async def list_threads(

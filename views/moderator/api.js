@@ -36,7 +36,10 @@ export function errorText(err) {
   return "请求失败";
 }
 
-/** True when the rejection looks like HTTP 409 (bridge may not expose the status code). */
+/**
+ * True when the rejection is the backend's "operation already running" conflict. The bridge rejects with
+ * Error(message) only (no HTTP status), so match the fixed backend wording ("...在进行，请稍后。").
+ */
 export function isConflict(err) {
-  return Boolean(err) && (err.status === 409 || /\b409\b/.test(String(err.message || "")));
+  return Boolean(err) && (err.status === 409 || /进行/.test(String(err.message || "")));
 }

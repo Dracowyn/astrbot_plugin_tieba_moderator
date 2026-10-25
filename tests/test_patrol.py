@@ -1,7 +1,7 @@
 """Offline patrol behavior, incremental progress and concurrency regressions."""
 
 import asyncio
-from dataclasses import replace
+from dataclasses import fields, replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -17,19 +17,70 @@ from astrbot_plugin_tieba_moderator.core.models import (
     TiebaActionError,
     Verdict,
 )
+from astrbot_plugin_tieba_moderator.core.settings import (
+    Account,
+    AccountDraft,
+    ForumDraft,
+    ForumEntry,
+    ForumOptions,
+    ForumOverrides,
+    GlobalSettings,
+    SettingsSnapshot,
+    default_global_settings,
+)
 from astrbot_plugin_tieba_moderator.core.store import Store
 from astrbot_plugin_tieba_moderator.services import tieba_gateway as gateway_module
 from astrbot_plugin_tieba_moderator.services.case_service import CaseService
-from astrbot_plugin_tieba_moderator.services.patrol import Patrol, PatrolSettings
+from astrbot_plugin_tieba_moderator.services.gateway_pool import GatewayPool
+from astrbot_plugin_tieba_moderator.services.patrol import Patrol, PatrolLimits
+from astrbot_plugin_tieba_moderator.services.settings_service import SettingsService
 from astrbot_plugin_tieba_moderator.services.tieba_gateway import PostBatch
 from astrbot_plugin_tieba_moderator.tests.fakes import (
     Clock,
-    FakeConfig,
     FakeEvent,
     FakeGateway,
     make_item,
     make_snapshot,
 )
+
+def make_settings(store, *, forums=("test",), **values):
+    """Build immutable settings and code-only limits for offline scenarios."""
+    limit_names = {field.name for field in fields(PatrolLimits)}
+    default_names = {field.name for field in fields(ForumOptions)}
+    limits = PatrolLimits(**{
+        key: value for key, value in values.items() if key in limit_names
+    })
+    defaults = replace(default_global_settings().defaults, **{
+        key: value for key, value in values.items() if key in default_names
+    })
+    global_ = GlobalSettings(defaults=defaults, **{
+        key: value for key, value in values.items()
+        if key not in limit_names and key not in default_names
+    })
+    snapshot = SettingsSnapshot(
+        global_=global_,
+        accounts=(Account(
+            id=1, name="offline", bduss="offline", stoken="offline",
+            created_at=0, updated_at=0,
+        ),),
+        forums=tuple(
+            ForumEntry(
+                id=index, fname=fname, account_id=1, created_at=0, updated_at=0
+            )
+            for index, fname in enumerate(forums, 1)
+        ),
+    )
+    return SettingsService(store, snapshot=snapshot), limits
+
+
+def make_patrol(*, gateway, store, judge, notify, clock, **values):
+    settings, limits = make_settings(store, **values)
+    pool = GatewayPool(settings.snapshot(), factory=lambda *args: gateway)
+    return Patrol(
+        pool=pool, store=store, judge=judge, notify=notify,
+        settings=settings, limits=limits, clock=clock,
+    )
+
 
 
 @pytest.fixture
@@ -41,12 +92,12 @@ def env(tmp_path):
     notify = AsyncMock()
 
     def build(**settings):
-        return Patrol(
+        return make_patrol(
             gateway=gateway,
             store=store,
             judge=judge,
             notify=notify,
-            settings=PatrolSettings(forums=("test",), **settings),
+            **settings,
             clock=clock,
         )
 
@@ -330,7 +381,7 @@ async def test_judge_breaker_resets_after_a_success(env):
     )
     calls = 0
 
-    async def judging(item, images):
+    async def judging(item, images, *, snapshot):
         nonlocal calls
         calls += 1
         if calls in (1, 2, 4, 5):
@@ -363,7 +414,7 @@ async def test_failed_comment_does_not_repeat_successful_siblings(env):
     gateway.get_new_posts.return_value = PostBatch(pairs=((post, 1),))
     gateway.get_comments.return_value = ([comment], True)
 
-    async def judging(item, images):
+    async def judging(item, images, *, snapshot):
         if item.kind is ItemKind.COMMENT:
             raise JudgeError("comment unavailable")
         return Verdict(violation=False)
@@ -454,12 +505,12 @@ async def test_notification_failure_does_not_change_case_or_progress(env):
 async def test_forum_error_does_not_abort_next_forum(env):
     store, gateway, judge, notify, _ = env
     gateway.list_threads.side_effect = [RuntimeError("bad forum"), [make_snapshot()]]
-    patrol = Patrol(
+    patrol = make_patrol(
         gateway=gateway,
         store=store,
         judge=judge,
         notify=notify,
-        settings=PatrolSettings(forums=("bad", "test")),
+        forums=("bad", "test"),
         clock=Clock(),
     )
     report = await patrol.run_once()
@@ -557,7 +608,7 @@ async def test_judge_concurrency_is_bounded_and_used(env):
     active = 0
     peak = 0
 
-    async def judging(*args):
+    async def judging(*args, **kwargs):
         nonlocal active, peak
         active += 1
         peak = max(peak, active)
@@ -587,12 +638,12 @@ async def test_round_purges_old_deduplication_but_preserves_recent(tmp_path):
         store.mark_seen("post:recent")
         gateway = FakeGateway()
         gateway.list_threads.return_value = []
-        patrol = Patrol(
+        patrol = make_patrol(
             gateway=gateway,
             store=store,
             judge=AsyncMock(),
             notify=AsyncMock(),
-            settings=PatrolSettings(forums=("test",)),
+            forums=("test",),
             clock=clock,
         )
         await patrol.run_once()
@@ -611,28 +662,31 @@ async def _collect(agen) -> list[str]:
 def command_env(tmp_path):
     """Run commands against real services and an in-memory remote substitute."""
     clock = Clock()
-    config = FakeConfig(
-        forums=["test"],
-        patrol={"enabled": False},
-        notify={"sessions": ["offline:group:test"]},
-    )
+    settings_values = {
+        "patrol_enabled": False, "sessions": ("offline:group:test",)
+    }
     context = SimpleNamespace(send_message=AsyncMock(return_value=True))
-    plugin = entry.TiebaModeratorPlugin(context, config)
+    plugin = entry.TiebaModeratorPlugin(context)
     store = Store(tmp_path / "commands.db", clock=clock)
     plugin._store = store
-    plugin._gateway = FakeGateway()
+    plugin._settings_service, _ = make_settings(store, **settings_values)
+    gateway = FakeGateway()
+    plugin._pool = GatewayPool(
+        plugin._snapshot(), factory=lambda *args: gateway
+    )
     plugin._judge = AsyncMock(
         return_value=Verdict(violation=True, confidence=0.8, reason="spam evidence")
     )
     plugin._cases = CaseService(
-        gateway=plugin._gateway, store=plugin._store, clock=clock
+        pool=plugin._pool, settings=plugin._settings_service,
+        store=plugin._store, clock=clock,
     )
     plugin._patrol = Patrol(
-        gateway=plugin._gateway,
+        pool=plugin._pool,
         store=plugin._store,
         judge=plugin._judge,
         notify=plugin._notify,
-        settings=plugin._settings,
+        settings=plugin._settings_service,
         clock=clock,
     )
     yield plugin, FakeEvent()
@@ -648,8 +702,10 @@ async def test_check_uses_real_metadata_without_creating_cases(
     item = make_item(
         title="actual thread title", fname="actual forum", image_urls=("fake://image",)
     )
-    plugin._gateway.get_thread_item_by_tid.return_value = item
-    plugin._settings = replace(plugin._settings, review_images=review_images)
+    plugin._pool.get(1).get_thread_item_by_tid.return_value = item
+    await plugin._settings_service.save_global(
+        replace(plugin._snapshot().global_, review_images=review_images)
+    )
     replies = [reply async for reply in plugin.tb_check(event, "10")]
     assert item.title in replies[0] and item.fname in replies[0]
     assert plugin._judge.await_args.args[0] == item
@@ -657,9 +713,9 @@ async def test_check_uses_real_metadata_without_creating_cases(
         ["data:image/png;base64,ZmFrZQ=="] if review_images else []
     )
     assert plugin._store.count_cases(CaseStatus.PENDING) == 0
-    plugin._gateway.delete.assert_not_awaited()
-    plugin._gateway.block.assert_not_awaited()
-    plugin._gateway.get_thread_item.assert_not_awaited()
+    plugin._pool.get(1).delete.assert_not_awaited()
+    plugin._pool.get(1).block.assert_not_awaited()
+    plugin._pool.get(1).get_thread_item.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -667,14 +723,14 @@ async def test_check_uses_real_metadata_without_creating_cases(
 async def test_check_invalid_tid_does_not_fetch_or_judge(command_env, tid):
     plugin, event = command_env
     [reply async for reply in plugin.tb_check(event, tid)]
-    plugin._gateway.get_thread_item_by_tid.assert_not_awaited()
+    plugin._pool.get(1).get_thread_item_by_tid.assert_not_awaited()
     plugin._judge.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_check_without_account_does_not_judge(command_env):
     plugin, event = command_env
-    plugin._gateway = None
+    await plugin._pool.update(replace(plugin._snapshot(), accounts=()))
     [reply async for reply in plugin.tb_check(event, "10")]
     plugin._judge.assert_not_awaited()
 
@@ -685,7 +741,7 @@ async def test_check_without_account_does_not_judge(command_env):
 )
 async def test_check_fetch_failure_stops_review(command_env, failure):
     plugin, event = command_env
-    plugin._gateway.get_thread_item_by_tid.side_effect = failure
+    plugin._pool.get(1).get_thread_item_by_tid.side_effect = failure
     replies = [reply async for reply in plugin.tb_check(event, "10")]
     assert str(failure) in replies[0]
     plugin._judge.assert_not_awaited()
@@ -701,8 +757,8 @@ async def test_check_failed_judgment_never_takes_action(command_env, failure):
     plugin._judge.side_effect = failure
     [reply async for reply in plugin.tb_check(event, "10")]
     assert plugin._store.count_cases(CaseStatus.PENDING) == 0
-    plugin._gateway.delete.assert_not_awaited()
-    plugin._gateway.block.assert_not_awaited()
+    plugin._pool.get(1).delete.assert_not_awaited()
+    plugin._pool.get(1).block.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -720,10 +776,10 @@ async def test_manual_patrol_reports_and_commands_transition_real_case(command_e
     assert case.item.fname in status[0]
     [reply async for reply in plugin.tb_del(event, str(case.id))]
     assert plugin._store.get_case(case.id).status is CaseStatus.DELETED
-    plugin._gateway.delete.assert_awaited_once()
+    plugin._pool.get(1).delete.assert_awaited_once()
     [reply async for reply in plugin.tb_ban(event, str(case.id), "3")]
     assert plugin._store.get_case(case.id).status is CaseStatus.BANNED
-    assert plugin._gateway.delete.await_count == 1
+    assert plugin._pool.get(1).delete.await_count == 1
     [reply async for reply in plugin.tb_restore(event, str(case.id))]
     assert plugin._store.get_case(case.id).status is CaseStatus.RESTORED
     [reply async for reply in plugin.tb_ignore(event, str(case.id))]
@@ -740,7 +796,7 @@ async def test_ignore_command_removes_case_from_pending_list(command_env):
     [reply async for reply in plugin.tb_list(event)]
     assert plugin._store.count_cases(CaseStatus.PENDING) == 0
     assert plugin._store.get_case(case.id).status is CaseStatus.IGNORED
-    plugin._gateway.delete.assert_not_awaited()
+    plugin._pool.get(1).delete.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -752,7 +808,7 @@ async def test_command_delete_failure_preserves_pending_case(command_env, failur
     case = plugin._store.create_case(
         make_item(), Verdict(violation=True), CaseStatus.PENDING, 1
     )
-    plugin._gateway.delete.side_effect = failure
+    plugin._pool.get(1).delete.side_effect = failure
     [reply async for reply in plugin.tb_del(event, str(case.id))]
     assert plugin._store.get_case(case.id) == case
 
@@ -768,8 +824,8 @@ async def test_case_commands_reject_invalid_ids_and_days(command_env):
     [reply async for reply in plugin.tb_show(event, "x")]
     [reply async for reply in plugin.tb_show(event, "999")]
     assert plugin._store.get_case(case.id) == case
-    plugin._gateway.delete.assert_not_awaited()
-    plugin._gateway.block.assert_not_awaited()
+    plugin._pool.get(1).delete.assert_not_awaited()
+    plugin._pool.get(1).block.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -870,7 +926,6 @@ async def test_status_hides_error_details_from_non_operators(command_env):
     operator = await anext(plugin.tb_status(event))
     assert "secret detail" in operator
     event.is_admin = lambda: False
-    plugin.config["notify"] = {"operators": []}
     public = await anext(plugin.tb_status(event))
     assert "secret detail" not in public
     assert "错误 1" in public
@@ -889,7 +944,7 @@ async def test_ban_days_parsing_is_bounded(command_env, days):
     else:
         assert "封禁天数只能是" in replies[0]
         assert plugin._store.get_case(case.id).status is CaseStatus.PENDING
-        plugin._gateway.block.assert_not_awaited()
+        plugin._pool.get(1).block.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -931,14 +986,15 @@ async def test_binding_is_idempotent_and_preserves_other_notification_settings(
     command_env,
 ):
     plugin, event = command_env
-    plugin.config["notify"] = {"sessions": [], "operators": ["moderator"]}
+    await plugin._settings_service.save_global(replace(
+        plugin._snapshot().global_, sessions=(), operators=frozenset({"moderator"})
+    ))
+    revision = plugin._snapshot().revision
     [reply async for reply in plugin.tb_bind(event)]
     [reply async for reply in plugin.tb_bind(event)]
-    assert plugin.config["notify"] == {
-        "sessions": [event.unified_msg_origin],
-        "operators": ["moderator"],
-    }
-    assert plugin.config.saves == 1
+    assert plugin._snapshot().global_.sessions == (event.unified_msg_origin,)
+    assert plugin._snapshot().global_.operators == frozenset({"moderator"})
+    assert plugin._snapshot().revision == revision + 1
 
 
 @pytest.mark.asyncio
@@ -946,8 +1002,9 @@ async def test_notification_attempts_all_sessions_and_reports_partial_failure(
     command_env,
 ):
     plugin, _ = command_env
-    plugin.config["notify"] = {"sessions": ["first", "second", "third"]}
-    plugin._forum_config, _ = entry.parse_forum_config(plugin.config)
+    await plugin._settings_service.save_global(replace(
+        plugin._snapshot().global_, sessions=("first", "second", "third")
+    ))
     plugin.context.send_message.side_effect = [
         RuntimeError("platform offline"),
         False,
@@ -964,27 +1021,30 @@ async def test_notification_attempts_all_sessions_and_reports_partial_failure(
         "third",
     ]
     assert plugin._store.get_case(case.id) == case
-    plugin.config["notify"] = {"sessions": []}
-    plugin._forum_config, _ = entry.parse_forum_config(plugin.config)
+    await plugin._settings_service.save_global(replace(
+        plugin._snapshot().global_, sessions=()
+    ))
     with pytest.raises(RuntimeError):
         await plugin._notify(case)
     assert plugin.context.send_message.await_count == 3
 
 
 @pytest.mark.asyncio
-async def test_initialize_rejects_malformed_credentials_without_echoing_them(
+async def test_initialize_ignores_legacy_credentials_without_echoing_them(
     tmp_path, monkeypatch
 ):
     logged: list[str] = []
     monkeypatch.setattr(entry.StarTools, "get_data_dir", lambda name: tmp_path)
     monkeypatch.setattr(
-        entry, "logger", SimpleNamespace(error=logged.append, warning=logged.append)
+        entry, "logger", SimpleNamespace(
+            error=logged.append, warning=logged.append, info=logged.append
+        )
     )
     bad_bduss = "b" * 40
     bad_stoken = "s" * 20
     plugin = entry.TiebaModeratorPlugin(
         SimpleNamespace(send_message=AsyncMock(return_value=True)),
-        FakeConfig(
+        dict(
             account={"bduss": bad_bduss, "stoken": bad_stoken},
             forums=["test"],
             patrol={"enabled": True},
@@ -992,13 +1052,13 @@ async def test_initialize_rejects_malformed_credentials_without_echoing_them(
     )
     await plugin.initialize()
     try:
-        assert plugin._gateway is None
-        assert plugin._patrol is None
-        assert plugin._cases is None
+        assert plugin._pool.any() is None
+        assert plugin._snapshot().accounts == ()
+        assert plugin._snapshot().forums == ()
+        assert plugin._patrol is not None
+        assert plugin._cases is not None
         assert plugin._task is None
         text = "\n".join(logged)
-        assert "格式不正确" in text
-        assert "不要带 BDUSS= 前缀或引号" in text
         assert bad_bduss not in text and bad_stoken not in text
     finally:
         await plugin.terminate()
@@ -1011,17 +1071,24 @@ async def test_initialize_manual_mode_and_terminate_release_services(
     gateway = FakeGateway()
     clock = Clock()
     monkeypatch.setattr(entry.StarTools, "get_data_dir", lambda name: tmp_path)
-    monkeypatch.setattr(entry, "TiebaGateway", lambda *args: gateway)
+    monkeypatch.setattr(
+        entry, "GatewayPool",
+        lambda snapshot: GatewayPool(snapshot, factory=lambda *args: gateway),
+    )
     monkeypatch.setattr(entry, "Store", lambda path: Store(path, clock=clock))
+    seed = Store(tmp_path / entry.DB_FILE, clock=clock)
+    seed.save_global(replace(default_global_settings(), patrol_enabled=False))
+    seed.close()
     plugin = entry.TiebaModeratorPlugin(
-        SimpleNamespace(send_message=AsyncMock(return_value=True)),
-        FakeConfig(
-            account={"bduss": "fake-bduss", "stoken": "fake-stoken"},
-            forums=["test"],
-            patrol={"enabled": False},
-        ),
+        SimpleNamespace(send_message=AsyncMock(return_value=True))
     )
     await plugin.initialize()
+    account = await plugin._settings_service.create_account(
+        AccountDraft(name="offline", bduss="offline", stoken="offline")
+    )
+    await plugin._settings_service.create_forum(
+        ForumDraft(fname="test", account_id=account.id)
+    )
     try:
         assert plugin._task is None
         assert plugin._cases is not None and plugin._patrol is not None
@@ -1040,28 +1107,27 @@ async def test_initialize_manual_mode_and_terminate_release_services(
 
 
 @pytest.mark.asyncio
-async def test_background_loop_records_round_and_terminates(command_env, monkeypatch):
+async def test_background_loop_records_round_and_terminates(command_env):
     plugin, event = command_env
     entered = asyncio.Event()
-    blocker = asyncio.Event()
-    sleep_calls = 0
+    original = plugin._patrol.run_once
 
-    async def sleep(seconds):
-        nonlocal sleep_calls
-        sleep_calls += 1
-        if sleep_calls > 1:
-            entered.set()
-            await blocker.wait()
+    async def run_round():
+        report = await original()
+        entered.set()
+        return report
 
-    monkeypatch.setattr(entry.asyncio, "sleep", sleep)
-    plugin._enabled = True
-    plugin._task = asyncio.create_task(plugin._patrol_loop())
+    plugin._patrol.run_once = run_round
+    await plugin._settings_service.save_global(replace(
+        plugin._snapshot().global_, patrol_enabled=True
+    ))
+    plugin._task = asyncio.create_task(plugin._patrol_loop(0))
     await asyncio.wait_for(entered.wait(), timeout=2)
     assert plugin._last_report.reported == 1
     status = [reply async for reply in plugin.tb_status(event)]
     assert str(plugin._interval) in status[0]
     await plugin.terminate()
-    assert plugin._task is None and plugin._gateway is None
+    assert plugin._task is None and plugin._pool is None
 
 
 @pytest.mark.asyncio
@@ -1113,7 +1179,8 @@ async def test_old_boundary_parent_scans_comments_without_reviewing_stale_body(e
     gateway.get_comments.return_value = ([comment], True)
     report = await build().run_once()
     assert report.reviewed == 1
-    judge.assert_awaited_once_with(comment, [])
+    assert judge.await_args.args == (comment, [])
+    assert judge.await_args.kwargs["snapshot"].forums[0].fname == "test"
     assert not store.is_seen(stale.key)
     assert store.get_post_mark(stale.pid) == 1
     gateway.get_thread_item.assert_not_awaited()
@@ -1125,7 +1192,8 @@ async def test_old_boundary_parent_scans_comments_without_reviewing_stale_body(e
         ("max_tieba_requests_per_round", -1),
         ("max_post_pages", 0),
         ("max_comment_pages", 0),
-        ("thread_pages", 0),
+        ("max_failures", 0),
+        ("max_consecutive_judge_failures", 0),
     ],
 )
 def test_invalid_read_limits_rejected(env, setting, value):
@@ -1233,14 +1301,12 @@ def budget_env(env, monkeypatch):
     gateway = gateway_module.TiebaGateway("offline", "offline")
 
     def build(**settings):
-        return Patrol(
+        return make_patrol(
             gateway=gateway,
             store=store,
             judge=judge,
             notify=notify,
-            settings=PatrolSettings(
-                forums=settings.pop("forums", ("test",)), **settings
-            ),
+            **settings,
             clock=Clock(),
         )
 
@@ -1538,3 +1604,288 @@ async def test_first_old_hot_thread_stops_at_lookback_and_only_reads_comment_tai
     judge.assert_not_awaited()
     assert store.get_thread_mark(10) == make_snapshot().last_time
     assert store.get_post_mark(101) == 100
+
+
+def multi_account_patrol(env, *, shared=False, max_items=60, breaker=3, read_limit=3):
+    """Use distinct remote content behind real pool and snapshot interfaces."""
+    store, _, judge, notify, _ = env
+    settings, _ = make_settings(store, forums=("alpha", "beta", "gamma"))
+    original = settings.snapshot()
+    snapshot = replace(
+        original,
+        global_=replace(original.global_, max_items_per_round=max_items),
+        accounts=(original.accounts[0], replace(original.accounts[0], id=2, name="two", bduss="two")),
+        forums=(
+            original.forums[0],
+            replace(original.forums[1], account_id=1 if shared else 2),
+            replace(original.forums[2], account_id=2, enabled=shared),
+            ForumEntry(id=4, fname="unassigned", created_at=0, updated_at=0),
+        ),
+    )
+    settings = SettingsService(store, snapshot=snapshot)
+    gateways = {1: FakeGateway(), 2: FakeGateway()}
+    ids = {"alpha": 10, "beta": 20, "gamma": 30}
+
+    def listing(fname, pages, *, budget):
+        return [make_snapshot(fname=fname, tid=ids[fname])]
+
+    def first(snap, *, budget):
+        return make_item(fname=snap.fname, tid=snap.tid, pid=snap.tid * 10), 0
+
+    for gateway in gateways.values():
+        gateway.list_threads.side_effect = listing
+        gateway.get_thread_item.side_effect = first
+    pool = GatewayPool(
+        snapshot, factory=lambda bduss, stoken: gateways[2 if bduss == "two" else 1]
+    )
+    patrol = Patrol(
+        pool=pool, store=store, judge=judge, notify=notify, settings=settings,
+        limits=PatrolLimits(
+            max_tieba_requests_per_round=read_limit,
+            max_consecutive_judge_failures=breaker,
+        ),
+        clock=Clock(),
+    )
+    return patrol, gateways, settings
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shared", [False, True])
+async def test_read_budgets_are_per_account_and_shared_by_its_forums(env, shared):
+    store, _, judge, _, _ = env
+    patrol, gateways, _ = multi_account_patrol(env, shared=shared)
+    report = await patrol.run_once()
+    assert report.reviewed == 2
+    assert [call.args[0].fname for call in judge.await_args_list] == [
+        "alpha", "gamma" if shared else "beta"
+    ]
+    first_budget = gateways[1].list_threads.await_args.kwargs["budget"]
+    second_budget = gateways[2].list_threads.await_args.kwargs["budget"]
+    assert first_budget is not second_budget
+    assert first_budget.used == second_budget.used == 3
+    assert gateways[1].list_threads.await_count == 1
+    assert report.errors == (
+        ("本轮贴吧请求达到上限，剩余帖子顺延",) if shared else ()
+    )
+    assert "unassigned" not in report.forums
+    assert store.get_thread_mark(10) is not None
+
+
+@pytest.mark.asyncio
+async def test_item_cap_remains_global_across_accounts(env):
+    store, _, judge, _, _ = env
+    patrol, gateways, _ = multi_account_patrol(env, max_items=1)
+    report = await patrol.run_once()
+    assert (report.reviewed, report.deferred) == (1, 1)
+    assert store.get_thread_mark(10) is not None
+    assert store.get_thread_mark(20) is None
+    assert judge.await_count == 1
+    assert gateways[2].get_thread_item.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_judge_breaker_remains_global_across_accounts(env):
+    _, _, judge, _, _ = env
+    judge.side_effect = JudgeError("offline model")
+    patrol, _, _ = multi_account_patrol(env, breaker=1)
+    report = await patrol.run_once()
+    assert (report.reviewed, report.deferred) == (1, 1)
+    assert judge.await_count == 1
+    assert sum("模型连续失败" in error for error in report.errors) == 1
+
+
+@pytest.mark.asyncio
+async def test_forum_thresholds_and_filters_use_resolved_options(env):
+    store, _, judge, notify, _ = env
+    patrol, gateways, settings = multi_account_patrol(env)
+    old = settings.snapshot()
+    forums = (
+        replace(old.forums[0], overrides=ForumOverrides(
+            auto_delete_enabled=True, auto_delete_threshold=0.8,
+            report_threshold=0.7, review_posts=False,
+        )),
+        replace(old.forums[1], overrides=ForumOverrides(
+            auto_delete_enabled=True, auto_delete_threshold=0.99,
+            report_threshold=0.95, thread_pages=2,
+        )),
+    )
+    patrol._settings = SettingsService(store, snapshot=replace(old, forums=forums))
+    judge.return_value = Verdict(violation=True, confidence=0.9)
+    report = await patrol.run_once()
+    assert report.auto_deleted == 1
+    assert report.reported == 0
+    gateways[1].delete.assert_awaited_once()
+    gateways[2].delete.assert_not_awaited()
+    gateways[1].get_new_posts.assert_not_awaited()
+    assert gateways[2].list_threads.await_args.args == ("beta", 2)
+    notify.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_round_pins_settings_and_all_gateways_until_notifications_finish(env, monkeypatch):
+    store, _, judge, notify, _ = env
+    settings = SettingsService(store)
+    await settings.save_global(replace(
+        settings.snapshot().global_,
+        defaults=replace(settings.snapshot().global_.defaults, auto_delete_enabled=True),
+    ))
+    one = await settings.create_account(AccountDraft(name="one", bduss="old-one", stoken="offline"))
+    two = await settings.create_account(AccountDraft(name="two", bduss="old-two", stoken="offline"))
+    await settings.create_forum(ForumDraft(fname="alpha", account_id=one.id))
+    await settings.create_forum(ForumDraft(fname="beta", account_id=two.id))
+    old = settings.snapshot()
+    gateways = {key: FakeGateway() for key in ("old-one", "old-two", "new-one", "new-two")}
+    for index, gateway in enumerate(gateways.values(), 1):
+        fname = "alpha" if index % 2 else "beta"
+        gateway.list_threads.return_value = [make_snapshot(fname=fname, tid=index * 10)]
+        gateway.get_thread_item.return_value = (
+            make_item(fname=fname, tid=index * 10, pid=index * 100, image_urls=("fake://image",)), 0
+        )
+    pool = GatewayPool(old, factory=lambda bduss, stoken: gateways[bduss])
+    started = asyncio.Event()
+    release = asyncio.Event()
+    notified = asyncio.Event()
+    finish_notify = asyncio.Event()
+
+    async def listing(*args, **kwargs):
+        started.set()
+        await release.wait()
+        return [make_snapshot(fname="alpha")]
+
+    async def notification(case):
+        if case.item.fname == "beta":
+            notified.set()
+            await finish_notify.wait()
+
+    gateways["old-one"].list_threads.side_effect = listing
+    notify.side_effect = notification
+    judge.return_value = Verdict(violation=True, confidence=0.95)
+    patrol = Patrol(
+        pool=pool, store=store, judge=judge, notify=notify, settings=settings,
+        clock=Clock(),
+    )
+    snapshot_calls = []
+    original_snapshot = settings.snapshot
+
+    def snapshot():
+        value = original_snapshot()
+        snapshot_calls.append(value)
+        return value
+
+    monkeypatch.setattr(settings, "snapshot", snapshot)
+    running = asyncio.create_task(patrol.run_once())
+    await asyncio.wait_for(started.wait(), 2)
+    assert snapshot_calls == [old]
+    await settings.save_global(replace(
+        old.global_, max_items_per_round=1, review_images=False,
+        defaults=replace(old.global_.defaults, auto_delete_threshold=0.99, report_threshold=0.97),
+    ))
+    await settings.update_account(one.id, AccountDraft(name="one", bduss="new-one"))
+    await settings.update_account(two.id, AccountDraft(name="two", bduss="new-two"))
+    await settings.update_forum(old.forums[1].id, ForumDraft(
+        fname="beta", account_id=two.id,
+        overrides=ForumOverrides(review_posts=False, rules="新吧规", provider_id="new-model"),
+    ))
+    await pool.update(original_snapshot())
+    gateways["old-one"].close.assert_not_awaited()
+    gateways["old-two"].close.assert_not_awaited()
+    release.set()
+    await asyncio.wait_for(notified.wait(), 2)
+    gateways["old-one"].close.assert_not_awaited()
+    gateways["old-two"].close.assert_not_awaited()
+    finish_notify.set()
+    report = await running
+    assert (report.reviewed, report.auto_deleted) == (2, 2)
+    assert all(call.kwargs["snapshot"] is old for call in judge.await_args_list)
+    assert snapshot_calls == [old]
+    for key in ("old-one", "old-two"):
+        gateways[key].delete.assert_awaited_once()
+        gateways[key].fetch_images.assert_awaited_once()
+        gateways[key].close.assert_awaited_once()
+        gateways[key].get_new_posts.assert_awaited_once()
+    next_report = await patrol.run_once()
+    assert (next_report.reviewed, next_report.deferred, next_report.auto_deleted, next_report.reported) == (1, 1, 0, 0)
+    assert snapshot_calls == [old, original_snapshot()]
+    assert judge.await_args.kwargs["snapshot"] is original_snapshot()
+    for key in ("new-one", "new-two"):
+        gateways[key].delete.assert_not_awaited()
+        gateways[key].fetch_images.assert_not_awaited()
+    await pool.close()
+
+
+@pytest.mark.asyncio
+async def test_same_account_forums_reuse_one_remaining_read_budget(env):
+    store, _, _, _, _ = env
+    patrol, gateways, _ = multi_account_patrol(env, shared=True, read_limit=4)
+    report = await patrol.run_once()
+    calls = gateways[1].list_threads.await_args_list
+    assert [call.args[0] for call in calls] == ["alpha", "beta"]
+    assert calls[0].kwargs["budget"] is calls[1].kwargs["budget"]
+    assert calls[0].kwargs["budget"].used == 4
+    assert (report.reviewed, report.deferred) == (2, 1)
+    assert store.get_thread_mark(10) is not None
+    assert store.get_thread_mark(20) is None
+    assert store.get_thread_mark(30) is not None
+
+
+@pytest.mark.asyncio
+async def test_waiting_round_takes_new_snapshot_only_after_previous_round(env):
+    _, gateway, judge, _, build = env
+    patrol = build()
+    old = patrol._settings.snapshot()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def listing(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            entered.set()
+            await release.wait()
+        return [make_snapshot(tid=calls * 10)]
+
+    gateway.list_threads.side_effect = listing
+    gateway.get_thread_item.side_effect = lambda snap, *, budget: (
+        make_item(tid=snap.tid, pid=snap.tid * 10), 0
+    )
+    running = asyncio.create_task(patrol.run_once())
+    await asyncio.wait_for(entered.wait(), 2)
+    queued = asyncio.create_task(patrol.run_once())
+    await asyncio.sleep(0)
+    updated = await patrol._settings.save_global(replace(
+        old.global_, defaults=replace(old.global_.defaults, review_posts=False)
+    ))
+    release.set()
+    reports = await asyncio.gather(running, queued)
+    assert [report.reviewed for report in reports] == [1, 1]
+    assert [call.kwargs["snapshot"] for call in judge.await_args_list] == [old, updated]
+    gateway.get_new_posts.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", ["reader", "global-user"])
+async def test_forum_whitelist_is_additive_without_leaking_to_other_forums(env, name):
+    store, _, judge, _, _ = env
+    patrol, gateways, settings = multi_account_patrol(env)
+    old = settings.snapshot()
+    snapshot = replace(
+        old,
+        global_=replace(old.global_, defaults=replace(
+            old.global_.defaults, whitelist=frozenset({"global-user"})
+        )),
+        forums=(
+            replace(old.forums[0], whitelist=frozenset({"reader"})),
+            old.forums[1],
+        ),
+    )
+    patrol._settings = SettingsService(store, snapshot=snapshot)
+    gateways[1].get_thread_item.side_effect = None
+    gateways[1].get_thread_item.return_value = (
+        make_item(fname="alpha", author=Author(user_id=1, portrait="p", user_name=name)),
+        0,
+    )
+    report = await patrol.run_once()
+    assert (report.skipped, report.reviewed) == (1, 1)
+    assert judge.await_args.args[0].fname == "beta"
+    assert store.is_seen("thread:100")

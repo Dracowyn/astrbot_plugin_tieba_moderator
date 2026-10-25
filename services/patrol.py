@@ -12,7 +12,8 @@ from __future__ import annotations
 import asyncio
 import dataclasses as dcs
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from typing import Protocol
 
 from astrbot.api import logger
 
@@ -22,13 +23,15 @@ from ..core.models import (
     CaseStatus,
     ContentItem,
     JudgeError,
-    JudgeFn,
     NotifyFn,
     PatrolReport,
     Verdict,
     decide_action,
 )
+from ..core.settings import ForumOptions, SettingsSnapshot, resolve
 from ..core.store import Store
+from .gateway_pool import GatewayPool
+from .settings_service import SettingsService
 from .tieba_gateway import (
     ReadBudget,
     RequestBudgetExceeded,
@@ -37,79 +40,77 @@ from .tieba_gateway import (
 )
 
 
-@dcs.dataclass(frozen=True, kw_only=True)
-class PatrolSettings:
-    """Patrol selection, review limits and automatic disposition settings."""
+class SnapshotJudge(Protocol):
+    """Content reviewer accepting a pinned patrol settings snapshot."""
 
-    forums: tuple[str, ...]
-    thread_pages: int = 1
-    lookback_hours: int = 6
-    review_posts: bool = True
-    review_comments: bool = True
-    skip_top_and_good: bool = True
-    skip_bawu: bool = True
-    whitelist: frozenset[str] = frozenset()
-    max_items_per_round: int = 60
+    async def __call__(
+        self, item: ContentItem, images: list[str], *, snapshot: SettingsSnapshot
+    ) -> Verdict: ...
+
+
+@dcs.dataclass(frozen=True, kw_only=True)
+class PatrolLimits:
+    """Code-only read, pagination and failure caps, not user settings."""
+
     max_tieba_requests_per_round: int = 200
     max_post_pages: int = 3
     max_comment_pages: int = 3
-    review_images: bool = True
-    max_images: int = 4
-    judge_concurrency: int = 2
-    auto_delete_enabled: bool = False
-    auto_delete_threshold: float = 0.9
-    report_threshold: float = 0.6
     max_failures: int = 3
     max_consecutive_judge_failures: int = 3
     """Consecutive judge-side failures that abort the remainder of a round."""
 
 
 class Patrol:
-    """Coordinate one gateway, persistent progress and moderation callbacks."""
+    """Coordinate leased account gateways and immutable round settings."""
 
     def __init__(
         self,
         *,
-        gateway: TiebaGateway,
+        pool: GatewayPool,
         store: Store,
-        judge: JudgeFn,
+        judge: SnapshotJudge,
         notify: NotifyFn,
-        settings: PatrolSettings,
+        settings: SettingsService,
         clock: Callable[[], float] = time.time,
+        limits: PatrolLimits = PatrolLimits(),
+        scrub: Callable[[str], str] = lambda text: text,
     ) -> None:
         """Configure an independently serialized patrol.
 
         Args:
-            gateway: Tieba content and moderation gateway.
+            pool: Account gateways pinned for the lifetime of each round.
             store: Synchronous persistent progress and case store.
             judge: Async content reviewer.
             notify: Async case notification callback.
-            settings: Selection, limits and action thresholds.
+            settings: Current immutable settings snapshots.
             clock: Injectable Unix clock used for reports and case timestamps.
+            limits: Code-only request, pagination and failure caps.
+            scrub: Removes credentials from text before it is logged or stored.
+                A gateway error can quote a credential (aiotieba echoes the
+                offending value), and these lines reach the log, the persisted
+                report and the moderator view.
 
         Raises:
-            ValueError: Concurrency, failure limits or page limits are not
-                positive, or a per-round item or request limit is negative.
+            ValueError: Failure or page limits are not positive, or the
+                per-account request limit is negative.
         """
-        if settings.judge_concurrency < 1:
-            raise ValueError("judge_concurrency must be positive")
-        if settings.max_failures < 1:
+        if limits.max_failures < 1:
             raise ValueError("max_failures must be positive")
-        if settings.max_consecutive_judge_failures < 1:
+        if limits.max_consecutive_judge_failures < 1:
             raise ValueError("max_consecutive_judge_failures must be positive")
-        if settings.max_items_per_round < 0:
-            raise ValueError("max_items_per_round must not be negative")
-        if settings.max_tieba_requests_per_round < 0:
+        if limits.max_tieba_requests_per_round < 0:
             raise ValueError("max_tieba_requests_per_round must not be negative")
-        for name in ("thread_pages", "max_post_pages", "max_comment_pages"):
-            if getattr(settings, name) < 1:
+        for name in ("max_post_pages", "max_comment_pages"):
+            if getattr(limits, name) < 1:
                 raise ValueError(f"{name} must be positive")
-        self._gateway = gateway
+        self._pool = pool
+        self._limits = limits
         self._store = store
         self._judge = judge
         self._notify = notify
         self._settings = settings
         self._clock = clock
+        self._scrub = scrub
         self._lock = asyncio.Lock()
 
     async def run_once(self) -> PatrolReport:
@@ -119,10 +120,23 @@ class Patrol:
             An immutable report including isolated forum, thread and item errors.
         """
         async with self._lock:
-            return await self._run_round()
+            snapshot = self._settings.snapshot()
+            account_ids = {
+                forum.account_id
+                for forum in snapshot.forums
+                if forum.enabled and forum.account_id is not None
+            }
+            # Lease entry pins every selected instance before its first await.
+            async with self._pool.lease_many(account_ids) as gateways:
+                return await self._run_round(snapshot, gateways)
 
     async def _collect(
-        self, snap: ThreadSnapshot, budget: ReadBudget, cutoff: int
+        self,
+        snap: ThreadSnapshot,
+        budget: ReadBudget,
+        cutoff: int,
+        gateway: TiebaGateway,
+        settings: ForumOptions,
     ) -> tuple[list[ContentItem], dict[int, int], list[str]]:
         """Collect new bodies and comments, separating old parent evidence.
 
@@ -132,19 +146,19 @@ class Patrol:
         warn only for previously marked threads and comment parents.
         Budget exhaustion propagates so no partial collection advances markers.
         """
-        settings = self._settings
+        limits = self._limits
         items: dict[str, ContentItem] = {}
         floors: dict[int, tuple[ContentItem, int]] = {}
         post_marks: dict[int, int] = {}
         warnings: list[str] = []
         mark = self._store.get_thread_mark(snap.tid)
         if mark is None:
-            item, replies = await self._gateway.get_thread_item(snap, budget=budget)
+            item, replies = await gateway.get_thread_item(snap, budget=budget)
             items[item.key] = item
             floors[item.pid] = (item, replies)
         if settings.review_posts and (mark is None or snap.last_time > mark):
-            batch = await self._gateway.get_new_posts(
-                snap, max(mark or 0, cutoff), settings.max_post_pages, budget=budget
+            batch = await gateway.get_new_posts(
+                snap, max(mark or 0, cutoff), limits.max_post_pages, budget=budget
             )
             for post, replies in batch.pairs:
                 # Preserve the complete ASC body but use the later DESC count.
@@ -155,17 +169,17 @@ class Patrol:
             if mark is not None and not batch.caught_up:
                 warnings.append(
                     f"帖子 {snap.tid} 两轮之间新增楼层过多，较早的 "
-                    f"{settings.max_post_pages} 页之外的新楼层未审查"
+                    f"{limits.max_post_pages} 页之外的新楼层未审查"
                 )
             for post, replies in floors.values():
                 post_marks[post.pid] = replies
                 previous = self._store.get_post_mark(post.pid)
                 if settings.review_comments and replies > (previous or 0):
-                    comments, caught_up = await self._gateway.get_comments(
+                    comments, caught_up = await gateway.get_comments(
                         post,
                         replies,
                         previous,
-                        settings.max_comment_pages,
+                        limits.max_comment_pages,
                         budget=budget,
                     )
                     for comment in comments:
@@ -174,12 +188,11 @@ class Patrol:
                         warnings.append(
                             f"帖子 {snap.tid} 楼层 {post.pid} "
                             "两轮之间新增楼中楼过多，较早的 "
-                            f"{settings.max_comment_pages} 页之外的新楼中楼未审查"
+                            f"{limits.max_comment_pages} 页之外的新楼中楼未审查"
                         )
         return list(items.values()), post_marks, warnings
 
-    def _skip(self, item: ContentItem, cutoff: int) -> bool:
-        settings = self._settings
+    def _skip(self, item: ContentItem, cutoff: int, settings: ForumOptions) -> bool:
         return (
             item.create_time < cutoff
             or item.author.user_name in settings.whitelist
@@ -187,26 +200,39 @@ class Patrol:
             or (settings.skip_bawu and item.author.is_bawu)
         )
 
-    async def _run_round(self) -> PatrolReport:
-        settings = self._settings
+    async def _run_round(
+        self, snapshot: SettingsSnapshot, gateways: Mapping[int, TiebaGateway]
+    ) -> PatrolReport:
+        settings = snapshot.global_
+        limits = self._limits
+        forums = tuple(
+            resolve(snapshot, forum.fname)
+            for forum in snapshot.forums
+            if forum.enabled and forum.account_id is not None
+        )
         started_at = int(self._clock())
         report = PatrolReport(
-            started_at=started_at, finished_at=started_at, forums=settings.forums
+            started_at=started_at,
+            finished_at=started_at,
+            forums=tuple(forum.fname for forum in forums),
         )
-        cutoff = started_at - settings.lookback_hours * 3600
         semaphore = asyncio.Semaphore(settings.judge_concurrency)
         remaining = settings.max_items_per_round
-        # Only explicit content API page attempts consume this round-local quota.
-        # Images, writes and concurrent manual checks never receive this object.
-        budget = ReadBudget(settings.max_tieba_requests_per_round)
+        # Each account shares one quota across its forums; images and writes
+        # never consume content API attempts.
+        budgets = {
+            account_id: ReadBudget(limits.max_tieba_requests_per_round)
+            for account_id in gateways
+        }
         budget_warned = False
         errors: list[str] = []
         consecutive_judge_failures = 0
         judge_tripped = False
 
         def error(message: str) -> None:
-            errors.append(message)
-            logger.warning("Tieba patrol: %s", message)
+            safe = self._scrub(message)
+            errors.append(safe)
+            logger.warning("Tieba patrol: %s", safe)
 
         def warn_budget() -> None:
             nonlocal budget_warned
@@ -241,7 +267,9 @@ class Patrol:
                 error(f"Case {case.id} notification failed: {notify_exc}")
             self._store.mark_seen(item.key)
 
-        async def review(item: ContentItem) -> bool:
+        async def review(
+            item: ContentItem, gateway: TiebaGateway, options: ForumOptions
+        ) -> bool:
             nonlocal report, consecutive_judge_failures, judge_tripped
             async with semaphore:
                 if judge_tripped:
@@ -251,24 +279,24 @@ class Patrol:
                 try:
                     images = []
                     if settings.review_images and item.image_urls:
-                        images = await self._gateway.fetch_images(
+                        images = await gateway.fetch_images(
                             item.image_urls, settings.max_images
                         )
                     report = dcs.replace(report, reviewed=report.reviewed + 1)
-                    verdict = await self._judge(item, images)
+                    verdict = await self._judge(item, images, snapshot=snapshot)
                     consecutive_judge_failures = 0
                     action = decide_action(
                         verdict,
-                        auto_delete_enabled=settings.auto_delete_enabled,
-                        auto_delete_threshold=settings.auto_delete_threshold,
-                        report_threshold=settings.report_threshold,
+                        auto_delete_enabled=options.auto_delete_enabled,
+                        auto_delete_threshold=options.auto_delete_threshold,
+                        report_threshold=options.report_threshold,
                     )
                     if action is not Action.NONE:
                         status = CaseStatus.PENDING
                         note = ""
                         if action is Action.AUTO_DELETE:
                             try:
-                                await self._gateway.delete(item)
+                                await gateway.delete(item)
                             except Exception as exc:
                                 note = f"自动删除失败：{exc}"
                                 error(f"{item.key}: Automatic deletion failed: {exc}")
@@ -308,14 +336,14 @@ class Patrol:
                         consecutive_judge_failures += 1
                         if (
                             consecutive_judge_failures
-                            >= settings.max_consecutive_judge_failures
+                            >= limits.max_consecutive_judge_failures
                         ):
                             judge_tripped = True
                             error(
                                 "模型连续失败，本轮提前停止审查（剩余条目顺延到下一轮）"
                             )
                     failures = self._store.record_failure(item.key)
-                    abandoned = failures >= settings.max_failures
+                    abandoned = failures >= limits.max_failures
                     disposition = "abandoned" if abandoned else "will retry"
                     error(
                         f"{item.key}: review failed ({failures}, {disposition}): {exc}"
@@ -325,28 +353,34 @@ class Patrol:
                         return True
                     return False
 
-        for fname in settings.forums:
+        for forum in forums:
+            fname = forum.fname
+            gateway = gateways.get(forum.account_id)
+            if gateway is None:
+                error(f"{fname} 吧没有可用的吧务账号")
+                continue
+            options = forum.options
+            cutoff = started_at - options.lookback_hours * 3600
+            budget = budgets[forum.account_id]
             if not budget.remaining:
-                # Unlisted forums may contain work, but their thread counts are
-                # unknown: deferred counts only fetched eligible snapshots.
+                # Counts are unknown for unlisted forums. Other accounts still
+                # have independent quotas and must continue this round.
                 warn_budget()
-                break
-            pages = min(settings.thread_pages, budget.remaining)
-            if pages < settings.thread_pages:
+                continue
+            pages = min(options.thread_pages, budget.remaining)
+            if pages < options.thread_pages:
                 warn_budget()
             try:
-                snapshots = await self._gateway.list_threads(
-                    fname, pages, budget=budget
-                )
+                snapshots = await gateway.list_threads(fname, pages, budget=budget)
             except RequestBudgetExceeded:
                 warn_budget()
-                break
+                continue
             except Exception as exc:
                 error(f"Forum {fname}: {exc}")
                 continue
             for snap in snapshots:
                 if snap.is_livepost or (
-                    settings.skip_top_and_good and (snap.is_top or snap.is_good)
+                    options.skip_top_and_good and (snap.is_top or snap.is_good)
                 ):
                     continue
                 if not budget.remaining:
@@ -355,7 +389,7 @@ class Patrol:
                     continue
                 try:
                     items, post_marks, warnings = await self._collect(
-                        snap, budget, cutoff
+                        snap, budget, cutoff, gateway, options
                     )
                     for warning in warnings:
                         error(warning)
@@ -364,7 +398,7 @@ class Patrol:
                     for item in items:
                         if self._store.is_seen(item.key):
                             continue
-                        if self._skip(item, cutoff):
+                        if self._skip(item, cutoff, options):
                             self._store.mark_seen(item.key)
                             report = dcs.replace(report, skipped=report.skipped + 1)
                         elif remaining:
@@ -376,7 +410,8 @@ class Patrol:
                     # Await every child even if a storage failure escapes review;
                     # no task may outlive the round and its serialization lock.
                     results = await asyncio.gather(
-                        *(review(item) for item in selected), return_exceptions=True
+                        *(review(item, gateway, options) for item in selected),
+                        return_exceptions=True,
                     )
                     for result in results:
                         if isinstance(result, BaseException):

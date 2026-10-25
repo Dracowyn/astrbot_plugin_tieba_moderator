@@ -1,6 +1,7 @@
 import asyncio
 from dataclasses import replace
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 from astrbot_plugin_tieba_moderator.core.models import (
@@ -9,6 +10,13 @@ from astrbot_plugin_tieba_moderator.core.models import (
     ItemKind,
     JudgeError,
     Verdict,
+)
+from astrbot_plugin_tieba_moderator.core.settings import (
+    ForumEntry,
+    ForumOptions,
+    ForumOverrides,
+    GlobalSettings,
+    SettingsSnapshot,
 )
 from astrbot_plugin_tieba_moderator.services import llm_judge
 from astrbot_plugin_tieba_moderator.services.llm_judge import LlmJudge
@@ -61,15 +69,31 @@ def make_item(images: tuple[str, ...] = ()) -> ContentItem:
 
 
 def make_judge(context, **overrides) -> LlmJudge:
-    kwargs = {
-        "provider_id": "vision",
-        "rules": "禁止广告",
-        "timeout_seconds": 5,
-        "review_images": True,
-        "max_images": 4,
-    }
-    kwargs.update(overrides)
-    return LlmJudge(context, **kwargs)
+    forum_rules = overrides.pop("forum_rules", {})
+    defaults = ForumOptions(
+        provider_id=overrides.pop("provider_id", "vision"),
+        rules=overrides.pop("rules", "禁止广告"),
+    )
+    global_ = GlobalSettings(
+        defaults=defaults,
+        judge_timeout_seconds=overrides.pop("timeout_seconds", 5),
+        **overrides,
+    )
+    snapshot = SettingsSnapshot(
+        global_=global_,
+        forums=tuple(
+            ForumEntry(
+                id=index,
+                fname=fname.strip(),
+                overrides=ForumOverrides(rules=rules),
+                created_at=0,
+                updated_at=0,
+            )
+            for index, (fname, rules) in enumerate(forum_rules.items(), 1)
+        ),
+    )
+    settings = Mock(snapshot=Mock(return_value=snapshot))
+    return LlmJudge(context, settings=settings)
 
 
 @pytest.mark.asyncio
@@ -96,7 +120,7 @@ async def test_judge_forwards_prompts_and_images():
 
 
 @pytest.mark.asyncio
-async def test_judge_selects_prebuilt_forum_prompts(monkeypatch):
+async def test_judge_caches_prompts_by_rule_text(monkeypatch):
     ctx = FakeContext(result=response(GOOD_JSON))
     judge = make_judge(
         ctx,
@@ -107,10 +131,8 @@ async def test_judge_selects_prebuilt_forum_prompts(monkeypatch):
         },
     )
 
-    def unexpected_prompt_build(rules):
-        pytest.fail("Configured prompts must be built during construction")
-
-    monkeypatch.setattr(llm_judge, "build_system_prompt", unexpected_prompt_build)
+    builder = Mock(wraps=llm_judge.build_system_prompt)
+    monkeypatch.setattr(llm_judge, "build_system_prompt", builder)
     for fname in (" pYtHoN ", "游戏", " STRASSE ", "未知", "Python"):
         await judge(replace(make_item(), fname=fname), [])
 
@@ -121,6 +143,8 @@ async def test_judge_selects_prebuilt_forum_prompts(monkeypatch):
         assert rules in prompt
         assert all(other not in prompt for other in all_rules - {rules})
     assert prompts[0] is prompts[4]
+    assert {call.args[0] for call in builder.call_args_list} == all_rules
+    assert builder.call_count == 4
 
 
 @pytest.mark.asyncio
@@ -270,7 +294,7 @@ async def test_judge_handles_empty_completion():
 async def test_judge_with_rules_uses_temporary_rules_and_keeps_instance_state():
     ctx = FakeContext(result=response(GOOD_JSON))
     judge = make_judge(ctx)
-    configured_prompt = judge._system_prompt
+    configured_snapshot = judge._settings.snapshot()
 
     verdict = await judge.judge_with_rules(make_item(), [], "临时吧规：允许交易")
 
@@ -278,7 +302,7 @@ async def test_judge_with_rules_uses_temporary_rules_and_keeps_instance_state():
     first = ctx.calls[0]["system_prompt"]
     assert "临时吧规：允许交易" in first
     assert "禁止广告" not in first
-    assert judge._system_prompt == configured_prompt
+    assert judge._settings.snapshot() is configured_snapshot
 
     # The configured rules still apply to the next patrol call.
     await judge(make_item(), [])
@@ -292,7 +316,7 @@ async def test_judge_with_rules_falls_back_to_configured_rules():
 
     await judge.judge_with_rules(make_item(), [], "   ")
 
-    assert ctx.calls[0]["system_prompt"] == judge._system_prompt
+    assert "禁止广告" in ctx.calls[0]["system_prompt"]
 
 
 @pytest.mark.asyncio
@@ -318,3 +342,64 @@ async def test_judge_with_rules_wraps_provider_failures():
 
 def test_temporary_rules_limit_is_documented():
     assert llm_judge.MAX_TEMP_RULES_CHARS == 8000
+
+
+@pytest.mark.asyncio
+async def test_live_rules_models_and_explicit_round_snapshot(monkeypatch):
+    ctx = FakeContext(result=response(GOOD_JSON))
+    judge = make_judge(ctx, forum_rules={"测试": "旧吧规", "共享": "旧吧规"})
+    original = judge._settings.snapshot()
+    builder = Mock(wraps=llm_judge.build_system_prompt)
+    monkeypatch.setattr(llm_judge, "build_system_prompt", builder)
+    await judge(make_item(), [])
+    await judge(replace(make_item(), fname="共享"), [])
+    assert builder.call_count == 1
+    changed = replace(
+        original,
+        forums=(
+            replace(
+                original.forums[0],
+                overrides=ForumOverrides(rules="新吧规", provider_id="new-model"),
+            ),
+        ),
+    )
+    judge._settings.snapshot.return_value = changed
+    await judge(make_item(), [])
+    await judge(make_item(), [], snapshot=original)
+    await judge.judge_with_rules(make_item(), [], "临时规则")
+    await judge.judge_with_rules(make_item(), [], " ")
+    assert [call["chat_provider_id"] for call in ctx.calls] == [
+        "vision", "vision", "new-model", "vision", "new-model", "new-model"
+    ]
+    assert "新吧规" in ctx.calls[2]["system_prompt"]
+    assert ctx.calls[0]["system_prompt"] is ctx.calls[3]["system_prompt"]
+    assert "临时规则" in ctx.calls[4]["system_prompt"]
+    assert ctx.calls[2]["system_prompt"] is ctx.calls[5]["system_prompt"]
+    assert builder.call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_live_image_limits_and_timeout_keep_round_override():
+    ctx = FakeContext(result=response(GOOD_JSON))
+    judge = make_judge(ctx)
+    original = judge._settings.snapshot()
+    changed = replace(
+        original,
+        global_=replace(
+            original.global_, max_images=1, judge_timeout_seconds=0.01
+        ),
+    )
+    judge._settings.snapshot.return_value = changed
+    item = make_item(("one", "two"))
+    await judge(item, ["data:a"])
+    with pytest.raises(JudgeError, match="图片"):
+        await judge(item, ["data:a"], snapshot=original)
+    ctx.delay = 0.02
+    with pytest.raises(JudgeError, match="超时"):
+        await judge(make_item(), [])
+    await judge(make_item(), [], snapshot=original)
+    judge._settings.snapshot.return_value = replace(
+        changed, global_=replace(changed.global_, review_images=False)
+    )
+    ctx.delay = 0
+    await judge(item, [])

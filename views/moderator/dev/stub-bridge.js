@@ -8,9 +8,8 @@
   const NOW = Math.floor(Date.now() / 1000);
   const DAY = 86400;
 
-  function http(message, status) {
-    return Object.assign(new Error(message), { status });
-  }
+  const S = window.__stubSettings;
+  const http = window.__stubHttp;
 
   // ---- deterministic filler data ----
   let seed = 7;
@@ -102,6 +101,7 @@
     if (c.status === "pending" && c.id > 30) c.status = "ignored";
   });
   cases.sort((a, b) => b.id - a.id);
+  if (params.has("firstrun")) cases.length = 0;
 
   // ---- images: small generated data URLs ----
   function imageUrl(caseId, index) {
@@ -136,9 +136,7 @@
 
   function statusDto() {
     return {
-      has_account: true, patrol_enabled: true, loop_running: true, manual_running: state.manualRunning, interval_seconds: 1800,
-      forums: ["龙", "示例"], auto_delete: { enabled: false, threshold: 0.9 }, report_threshold: 0.6, pending: pendingCount(),
-      last_report: state.reports[0] || null,
+      ...S.statusFields(), manual_running: state.manualRunning, loop_running: true, pending: pendingCount(), last_report: state.reports[0] || null,
     };
   }
 
@@ -157,9 +155,9 @@
     return { total, items: rows };
   }
 
-  function stats(days) {
+  function stats(days, fname) {
     const since = NOW - days * DAY;
-    const rows = cases.filter((c) => c.created_at >= since);
+    const rows = cases.filter((c) => c.created_at >= since && (!fname || c.item.fname === fname));
     const by_status = { pending: 0, auto_deleted: 0, deleted: 0, banned: 0, ignored: 0, restored: 0 };
     const byCat = new Map();
     const buckets = Array.from({ length: 10 }, (_, i) => ({ low: i / 10, high: (i + 1) / 10, total: 0, confirmed: 0, false_positive: 0 }));
@@ -204,10 +202,12 @@
   async function route(method, path, payload) {
     if (failing.has(path.split("/")[0])) throw http("模拟的接口错误：服务器内部错误，详见 AstrBot 日志", 500);
     const parts = path.split("/");
+    const settings = await S.route(method, path, payload);
+    if (settings !== undefined) return settings;
     if (method === "GET") {
       if (path === "status") return statusDto();
       if (path === "cases") return listCases(payload);
-      if (path === "stats") return stats(Number(payload.days || 30));
+      if (path === "stats") return stats(Number(payload.days || 30), payload.fname);
       if (path === "reports") return state.reports.slice(0, Number(payload.limit || 20));
       if (parts[0] === "cases" && parts[2] === "images") {
         const c = cases.find((x) => x.id === Number(parts[1]));
@@ -220,7 +220,7 @@
       if (parts[0] === "cases" && parts.length === 2) return cases.find((x) => x.id === Number(parts[1])) || Promise.reject(http("案件不存在", 404));
     } else {
       if (path === "patrol/run") {
-        if (state.manualRunning) throw http("已有一轮手动巡查在进行", 409);
+        if (state.manualRunning) throw http("已有一轮手动巡查在进行，请稍后。", 409);
         state.manualRunning = true;
         const started = Math.floor(Date.now() / 1000);
         setTimeout(() => {
@@ -232,14 +232,17 @@
       if (path === "check") {
         const tid = payload && payload.tid;
         if (!Number.isInteger(tid) || tid <= 0) throw http("tid 必须是正整数", 400);
-        if (String(tid).endsWith("409")) throw http("已有一次试判在进行", 409);
+        if (String(tid).endsWith("409")) throw http("已有一次试判在进行，请稍后。", 409);
         if (String(tid).endsWith("0")) throw http("审查失败：LLM 调用超时（stub 模拟）", 502);
         await sleep(1200);
-        const item = clone(makeCase(0, { item: { tid, title: `试判帖子 ${tid}`, text: "试判取回的正文。\n第二行。", image_count: 3, link: `https://tieba.baidu.com/p/${tid}` } }).item);
+        const fname = tid % 2 ? "龙" : "示例";
+        const eff = S.resolve(fname);
+        const item = clone(makeCase(0, { item: { fname, tid, title: `试判帖子 ${tid}`, text: "试判取回的正文。\n第二行。", image_count: 3, link: `https://tieba.baidu.com/p/${tid}` } }).item);
         return {
           item,
           verdict: { violation: true, category: "广告引流", confidence: 0.82, reason: payload.rules ? "按临时吧规判定：含联系方式。" : "按配置吧规判定：含联系方式。", ban_days: 1 },
-          action: "report", images_reviewed: 2, images_total: 3,
+          action: "report", images_reviewed: 2, images_total: 3, fname,
+          thresholds: { auto_delete: { enabled: eff.auto_delete_enabled, threshold: eff.auto_delete_threshold }, report_threshold: eff.report_threshold },
         };
       }
       if (parts[0] === "cases" && parts.length === 3) return act(Number(parts[1]), parts[2], payload);
@@ -261,6 +264,19 @@
     handlers.forEach((h) => h({ ...context }));
   };
 
+  /** Latency, JSON round trip, failure injection, and the credential-leak assertion on every response. */
+  async function guarded(path, run) {
+    await sleep(latency);
+    try {
+      const result = clone(await run());
+      S.assertNoSecrets(result);
+      return result;
+    } catch (err) {
+      S.assertNoSecrets(err);
+      throw new Error(err.message);
+    }
+  }
+
   window.AstrBotPluginView = {
     async ready() { await sleep(30); return { ...context }; },
     getContext: () => ({ ...context }),
@@ -268,7 +284,7 @@
     getI18n: () => ({}),
     t: (key, fallback) => fallback,
     onContext(handler) { handlers.add(handler); return () => handlers.delete(handler); },
-    async apiGet(path, query) { await sleep(latency); return clone(await route("GET", path, query || {})); },
-    async apiPost(path, body) { await sleep(latency); return clone(await route("POST", path, body || {})); },
+    async apiGet(path, query) { return guarded(path, () => route("GET", path, query || {})); },
+    async apiPost(path, body) { return guarded(path, () => route("POST", path, body || {})); },
   };
 })();

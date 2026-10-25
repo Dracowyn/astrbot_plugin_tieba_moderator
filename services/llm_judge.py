@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
 
 from astrbot.api import logger
 from astrbot.api.star import Context
@@ -11,6 +10,8 @@ from astrbot.core.exceptions import ProviderNotFoundError
 
 from ..core.judge import build_system_prompt, build_user_prompt, parse_verdict
 from ..core.models import ContentItem, JudgeError, Verdict
+from ..core.settings import SettingsSnapshot, resolve
+from .settings_service import SettingsService
 
 MAX_TEMP_RULES_CHARS = 8000
 """Longest temporary rule text accepted by the WebUI trial review."""
@@ -24,45 +25,36 @@ class LlmJudge:
     failure never turns into a "no violation" verdict.
     """
 
-    def __init__(
-        self,
-        context: Context,
-        *,
-        provider_id: str,
-        rules: str,
-        timeout_seconds: float,
-        review_images: bool,
-        max_images: int,
-        forum_rules: Mapping[str, str] | None = None,
-    ) -> None:
-        """Create the judge.
+    def __init__(self, context: Context, *, settings: SettingsService) -> None:
+        """Use live settings, caching system prompts by their exact rule text.
 
         Args:
             context: The AstrBot star context.
-            provider_id: Chat provider id; empty means the default chat provider.
-            rules: Forum rules written by the moderators.
-            timeout_seconds: Timeout for one LLM call.
-            review_images: Whether images are supposed to be reviewed.
-            max_images: Maximum images per item when reviewing images.
-            forum_rules: Rules by forum name; unknown forums use ``rules``.
+            settings: Current immutable settings snapshots.
         """
         self._context = context
-        self._provider_id = provider_id
-        self._system_prompt = build_system_prompt(rules)
-        self._forum_prompts = {
-            fname.strip().casefold(): build_system_prompt(forum_rule)
-            for fname, forum_rule in (forum_rules or {}).items()
-        }
-        self._timeout = timeout_seconds
-        self._review_images = review_images
-        self._max_images = max_images
+        self._settings = settings
+        self._prompts: dict[str, str] = {}
 
-    async def __call__(self, item: ContentItem, image_data_urls: list[str]) -> Verdict:
+    def _prompt(self, rules: str) -> str:
+        """Build each distinct rule prompt only once."""
+        if rules not in self._prompts:
+            self._prompts[rules] = build_system_prompt(rules)
+        return self._prompts[rules]
+
+    async def __call__(
+        self,
+        item: ContentItem,
+        image_data_urls: list[str],
+        *,
+        snapshot: SettingsSnapshot | None = None,
+    ) -> Verdict:
         """Judge one item with the configured forum rules.
 
         Args:
             item: The item to judge.
             image_data_urls: Images already downloaded by the patrol, as data URLs.
+            snapshot: Optional pinned patrol-round settings; otherwise use current.
 
         Returns:
             The parsed verdict.
@@ -71,10 +63,15 @@ class LlmJudge:
             JudgeError: Provider missing, images missing, timeout, provider error
                 or unparsable output.
         """
-        system_prompt = self._forum_prompts.get(
-            item.fname.strip().casefold(), self._system_prompt
+        current = snapshot if snapshot is not None else self._settings.snapshot()
+        options = resolve(current, item.fname).options
+        return await self._judge(
+            item,
+            image_data_urls,
+            self._prompt(options.rules),
+            current,
+            options.provider_id,
         )
-        return await self._judge(item, image_data_urls, system_prompt)
 
     async def judge_with_rules(
         self, item: ContentItem, image_data_urls: list[str], rules: str
@@ -98,12 +95,23 @@ class LlmJudge:
         Raises:
             JudgeError: Same conditions as ``__call__``.
         """
-        if not rules.strip():
-            return await self(item, image_data_urls)
-        return await self._judge(item, image_data_urls, build_system_prompt(rules))
+        snapshot = self._settings.snapshot()
+        options = resolve(snapshot, item.fname).options
+        return await self._judge(
+            item,
+            image_data_urls,
+            self._prompt(rules if rules.strip() else options.rules),
+            snapshot,
+            options.provider_id,
+        )
 
     async def _judge(
-        self, item: ContentItem, image_data_urls: list[str], system_prompt: str
+        self,
+        item: ContentItem,
+        image_data_urls: list[str],
+        system_prompt: str,
+        snapshot: SettingsSnapshot,
+        provider_id: str,
     ) -> Verdict:
         """Run one judge call with an explicit system prompt.
 
@@ -111,6 +119,8 @@ class LlmJudge:
             item: The item to judge.
             image_data_urls: Downloaded images as data URLs.
             system_prompt: System prompt carrying the rules to apply.
+            snapshot: Settings pinned for this call's timeout and image policy.
+            provider_id: The resolved forum provider, or empty for the default.
 
         Returns:
             The parsed verdict.
@@ -119,8 +129,11 @@ class LlmJudge:
             JudgeError: Provider missing, images missing, timeout, provider error
                 or unparsable output.
         """
+        settings = snapshot.global_
         expected = (
-            min(len(item.image_urls), self._max_images) if self._review_images else 0
+            min(len(item.image_urls), settings.max_images)
+            if settings.review_images
+            else 0
         )
         if len(image_data_urls) < expected:
             # Judging without the images would let image-only spam through.
@@ -128,7 +141,6 @@ class LlmJudge:
                 f"应审查 {expected} 张图片，实际只拿到 {len(image_data_urls)} 张"
             )
 
-        provider_id = self._provider_id
         if not provider_id:
             provider = self._context.get_using_provider()
             if provider is None:
@@ -148,10 +160,12 @@ class LlmJudge:
                     prompt=prompt,
                     image_urls=list(image_data_urls) or None,
                 ),
-                timeout=self._timeout,
+                timeout=settings.judge_timeout_seconds,
             )
         except TimeoutError:
-            raise JudgeError(f"LLM 调用超时（{self._timeout:g} 秒）") from None
+            raise JudgeError(
+                f"LLM 调用超时（{settings.judge_timeout_seconds:g} 秒）"
+            ) from None
         except ProviderNotFoundError:
             raise JudgeError(f"找不到模型提供商 {provider_id}") from None
         except Exception as exc:

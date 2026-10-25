@@ -1,4 +1,4 @@
-"""Parse global defaults and per-forum overrides without mutating configuration."""
+"""Immutable forum profiles and unchanged moderation permission scopes."""
 
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -6,6 +6,7 @@ from types import MappingProxyType
 from typing import Any
 
 from .models import CaseStatus
+from .settings import SettingsSnapshot
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -18,15 +19,6 @@ class ForumProfile:
     operators: frozenset[str]
     rules_overridden: bool = False
     sessions_overridden: bool = False
-
-
-MAX_FORUM_ARG_CHARS = 64
-"""Longest forum name accepted from chat when binding a session."""
-
-
-def _reply_text(value: str) -> str:
-    """Flatten chat text that is about to be echoed back into a reply."""
-    return " ".join(str(value).split())
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -67,6 +59,33 @@ class ForumConfig:
     default_sessions: tuple[str, ...]
     global_operators: frozenset[str]
     profiles: Mapping[str, ForumProfile]
+
+    @classmethod
+    def from_snapshot(cls, snapshot: SettingsSnapshot) -> "ForumConfig":
+        """Build profiles for every configured forum, including disabled ones."""
+        global_ = snapshot.global_
+        profiles = {
+            forum.fname.strip().casefold(): ForumProfile(
+                fname=forum.fname,
+                rules=(
+                    global_.defaults.rules
+                    if forum.overrides.rules is None
+                    else forum.overrides.rules
+                ),
+                sessions=forum.sessions or global_.sessions,
+                operators=forum.operators,
+                rules_overridden=forum.overrides.rules is not None,
+                sessions_overridden=bool(forum.sessions),
+            )
+            for forum in snapshot.forums
+        }
+        return cls(
+            forums=tuple(forum.fname for forum in snapshot.forums),
+            default_rules=global_.defaults.rules,
+            default_sessions=global_.sessions,
+            global_operators=global_.operators,
+            profiles=MappingProxyType(profiles),
+        )
 
     def profile(self, fname: str) -> ForumProfile:
         """Resolve an override or return global defaults for the requested forum.
@@ -161,96 +180,6 @@ class ForumConfig:
         return self.forum_key(fname) in scope.forums
 
 
-def _string_list(value: object) -> tuple[str, ...]:
-    """Normalize a list into nonblank, distinct strings in input order."""
-    if not isinstance(value, list):
-        return ()
-    return tuple(dict.fromkeys(text for item in value if (text := str(item).strip())))
-
-
-def parse_forum_config(config: Mapping[str, Any]) -> tuple[ForumConfig, list[str]]:
-    """Parse tolerant forum settings without modifying the supplied mapping.
-
-    Args:
-        config: Plugin configuration containing global and per-forum settings.
-
-    Returns:
-        An immutable resolved snapshot and English warnings for skipped entries.
-    """
-    judge = config.get("judge", {})
-    notify = config.get("notify", {})
-    if not isinstance(judge, Mapping):
-        judge = {}
-    if not isinstance(notify, Mapping):
-        notify = {}
-    default_rules = judge.get("rules")
-    if not isinstance(default_rules, str) or not default_rules.strip():
-        default_rules = ""
-    default_sessions = _string_list(notify.get("sessions"))
-    global_operators = frozenset(
-        _identity(value) for value in _string_list(notify.get("operators"))
-    )
-    warnings: list[str] = []
-    forums: dict[str, str] = {}
-    raw_forums = config.get("forums", [])
-    if not isinstance(raw_forums, list):
-        raw_forums = []
-    for index, fname in enumerate(raw_forums):
-        if not isinstance(fname, str) or not fname.strip():
-            warnings.append(
-                f"Skipping forums[{index}]: fname must be a nonblank string."
-            )
-            continue
-        name = fname.strip()
-        forums.setdefault(name.casefold(), name)
-
-    profiles: dict[str, ForumProfile] = {}
-    overrides = config.get("forum_overrides", [])
-    if not isinstance(overrides, list):
-        overrides = []
-    for index, entry in enumerate(overrides):
-        if not isinstance(entry, dict):
-            warnings.append(
-                f"Skipping forum_overrides[{index}]: expected a dictionary."
-            )
-            continue
-        fname = entry.get("fname")
-        if not isinstance(fname, str) or not fname.strip():
-            warnings.append(
-                f"Skipping forum_overrides[{index}]: fname must be a nonblank string."
-            )
-            continue
-        name = fname.strip()
-        key = name.casefold()
-        if key in profiles:
-            warnings.append(
-                f"Duplicate forum override at index {index} for {name!r}; keeping the first."
-            )
-            continue
-        rules = entry.get("rules")
-        if not isinstance(rules, str) or not rules.strip():
-            rules = ""
-        sessions = _string_list(entry.get("sessions"))
-        profiles[key] = ForumProfile(
-            fname=name,
-            rules=rules or default_rules,
-            sessions=sessions or default_sessions,
-            operators=frozenset(
-                _identity(value) for value in _string_list(entry.get("operators"))
-            ),
-            rules_overridden=bool(rules),
-            sessions_overridden=bool(sessions),
-        )
-        forums.setdefault(key, name)
-    return ForumConfig(
-        forums=tuple(forums.values()),
-        default_rules=default_rules,
-        default_sessions=default_sessions,
-        global_operators=global_operators,
-        profiles=MappingProxyType(profiles),
-    ), warnings
-
-
 def scope_forum_keys(scope: OperatorScope) -> tuple[str, ...]:
     """Forum keys a scope may list, for ``query_cases``.
 
@@ -320,92 +249,16 @@ class BindResult:
     total: int
 
 
-def _sessions_of(target: Mapping) -> list[str]:
-    """Read a push-session list tolerantly.
+def parse_case_id(raw: str) -> int | None:
+    """Parse a positive id argument that fits in SQLite's INTEGER.
 
     Args:
-        target: A config section that may hold a ``sessions`` list.
+        raw: The raw command argument.
 
     Returns:
-        Nonblank, distinct session strings in input order.
+        The id, or None when it is not a positive decimal integer.
     """
-    raw = target.get("sessions")
-    if not isinstance(raw, list):
-        return []
-    return list(
-        dict.fromkeys(str(value).strip() for value in raw if str(value).strip())
-    )
-
-
-def bind_session(
-    config: dict, forum_config: ForumConfig, fname: str, session: str
-) -> BindResult | str:
-    """Append a session to the global or a per-forum push list, in memory only.
-
-    The caller persists the config and reparses ``ForumConfig``; keeping the
-    mutation here keeps ``main.py`` to command wiring and lets the write path be
-    tested without a Star instance.
-
-    A forum name typed in chat only ever selects an existing, patrolled forum:
-    the stored ``fname`` always comes from the parsed config, never from the
-    raw argument, so the argument cannot introduce another entry.
-
-    Args:
-        config: Plugin configuration, mutated in place on success.
-        forum_config: Currently parsed config, used to validate the forum name.
-        fname: Raw forum argument; empty selects the global list.
-        session: Session origin to append.
-
-    Returns:
-        A Chinese reply on refusal, otherwise the append result.
-    """
-    label = ""
-    if fname:
-        if len(fname) > MAX_FORUM_ARG_CHARS:
-            # The argument is echoed in the refusal, so bound it first: chat text
-            # must not be able to produce a multi-kilobyte reply.
-            return "吧名过长，不能绑定推送会话。"
-        key = fname.casefold()
-        names = {name.casefold(): name for name in forum_config.forums}
-        if key not in names:
-            return f"未巡查 {_reply_text(fname)} 吧，不能绑定推送会话。"
-        entries = config.get("forum_overrides")
-        entries = list(entries) if isinstance(entries, list) else []
-        index = next(
-            (
-                position
-                for position, value in enumerate(entries)
-                if isinstance(value, dict)
-                and isinstance(value.get("fname"), str)
-                and value["fname"].strip().casefold() == key
-            ),
-            len(entries),
-        )
-        target = (
-            entries[index]
-            if index < len(entries)
-            else {
-                "__template_key": "forum",
-                "fname": names[key],
-                "rules": "",
-                "sessions": [],
-                "operators": [],
-            }
-        )
-        label = f"{names[key]} 吧的"
-    else:
-        target = config.get("notify")
-        if not isinstance(target, Mapping):
-            # A malformed notify section must not abort the command.
-            target = {}
-
-    sessions = _sessions_of(target)
-    if session in sessions:
-        return f"当前会话已经在{label}推送列表里。"
-    updated = {**target, "sessions": [*sessions, session]}
-    if fname:
-        entries[index : index + 1] = [updated]
-        config["forum_overrides"] = entries
-    else:
-        config["notify"] = updated
-    return BindResult(label=label, total=len(sessions) + 1)
+    raw = raw.strip()
+    if not raw.isdecimal() or len(raw) > 18 or int(raw) <= 0:
+        return None
+    return int(raw)
